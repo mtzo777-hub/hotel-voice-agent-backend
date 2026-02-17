@@ -1,4 +1,5 @@
-﻿# Python / venv
+
+# Python / venv
 .venv/
 __pycache__/
 *.pyc
