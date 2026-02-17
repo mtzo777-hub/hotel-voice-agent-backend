@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+numpy
+faiss-cpu
+openai>=1.0.0
+pydantic>=2.0.0
+python-dotenv>=1.0.1
+

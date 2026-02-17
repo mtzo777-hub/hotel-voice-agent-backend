@@ -1,0 +1,602 @@
+[
+    {
+        "id": "hotel_identity",
+        "text": "This assistant provides information only for Sunshine Hotel Singapore (the Sunshine Hotel property located in Singapore)."
+    },
+    {
+        "id": "checkin_time",
+        "text": "At Sunshine Hotel Singapore, check-in starts at 2:00 PM."
+    },
+    {
+        "id": "checkout_time",
+        "text": "At Sunshine Hotel Singapore, check-out must be completed by 11:00 AM."
+    },
+    {
+        "id": "early_checkin_policy",
+        "text": "Early check-in may be requested, subject to room availability, and additional charges may apply."
+    },
+    {
+        "id": "late_checkout_policy",
+        "text": "Late check-out requests depend on room availability and may incur additional charges."
+    },
+    {
+        "id": "front_desk_hours",
+        "text": "The front desk at Sunshine Hotel Singapore operates 24 hours a day."
+    },
+    {
+        "id": "quiet_hours",
+        "text": "Quiet hours are observed from 10:00 PM to 7:00 AM. Guests are kindly asked to keep noise to a minimum during these hours."
+    },
+    {
+        "id": "contact_email",
+        "text": "You can email Sunshine Hotel Singapore at reservations@sunshinehotel.com."
+    },
+    {
+        "id": "contact_phone",
+        "text": "You can contact Sunshine Hotel Singapore by phone at +65 6123 4567."
+    },
+    {
+        "id": "address",
+        "text": "Sunshine Hotel Singapore is located in central Singapore. Please refer to your booking confirmation for the full address and directions."
+    },
+    {
+        "id": "currency",
+        "text": "All charges at Sunshine Hotel Singapore are billed in Singapore Dollars (SGD)."
+    },
+    {
+        "id": "payment_methods",
+        "text": "Sunshine Hotel Singapore accepts Visa, MasterCard, American Express, debit cards, and cash."
+    },
+    {
+        "id": "deposit_policy",
+        "text": "A refundable security deposit may be required at check-in to cover incidental charges. The amount and method depend on your booking and payment type."
+    },
+    {
+        "id": "incidental_charges",
+        "text": "Incidental charges (such as minibar or room service) are billed to your room and settled at check-out unless otherwise arranged."
+    },
+    {
+        "id": "invoice_request",
+        "text": "If you need an invoice, please request it at check-out or email reservations with your booking details."
+    },
+    {
+        "id": "taxes_fees",
+        "text": "Room rates may be subject to applicable taxes and service charges. The final amount depends on your booking terms."
+    },
+    {
+        "id": "cashless_payments",
+        "text": "Contactless payments are supported where available, subject to the card issuer and terminal compatibility."
+    },
+    {
+        "id": "authorization_hold",
+        "text": "A pre-authorization hold may be placed on your card at check-in and released after check-out, depending on your bank’s processing time."
+    },
+    {
+        "id": "room_types",
+        "text": "Sunshine Hotel Singapore offers Deluxe Rooms, Premier Rooms, Executive Suites, Family Suites, and selected Accessible Rooms."
+    },
+    {
+        "id": "bed_types",
+        "text": "Most rooms offer either a king bed or twin beds, subject to availability."
+    },
+    {
+        "id": "extra_bed_policy",
+        "text": "Extra beds are available upon request and may involve additional charges, subject to availability."
+    },
+    {
+        "id": "connecting_rooms",
+        "text": "Connecting rooms can be requested and are subject to availability. Please contact reservations before arrival."
+    },
+    {
+        "id": "baby_cot",
+        "text": "Complimentary baby cots are available upon request, subject to availability."
+    },
+    {
+        "id": "room_capacity",
+        "text": "Room occupancy limits depend on the room type. Please refer to your booking confirmation for the maximum occupancy."
+    },
+    {
+        "id": "smoking_policy",
+        "text": "Smoking is strictly prohibited in non-smoking rooms and all indoor public areas. A cleaning fee may apply if smoking is detected."
+    },
+    {
+        "id": "in_room_safe",
+        "text": "An in-room safe is available in most rooms for storing valuables."
+    },
+    {
+        "id": "minibar",
+        "text": "Select rooms include a minibar. Items are charged based on consumption unless otherwise stated."
+    },
+    {
+        "id": "room_cleaning",
+        "text": "Housekeeping is provided daily. If you prefer a specific time, please inform the front desk."
+    },
+    {
+        "id": "towels_linen",
+        "text": "Towels and linens can be changed daily. To support sustainability, you may request reduced-change service."
+    },
+    {
+        "id": "iron_board",
+        "text": "An iron and ironing board are available upon request, subject to availability."
+    },
+    {
+        "id": "hair_dryer",
+        "text": "A hair dryer is provided in-room in most room types."
+    },
+    {
+        "id": "universal_adapters",
+        "text": "Universal power adapters may be available for loan at the front desk, subject to availability."
+    },
+    {
+        "id": "wifi",
+        "text": "Complimentary (free) high-speed Wi‑Fi is available throughout the hotel at no extra charge."
+    },
+    {
+        "id": "pool",
+        "text": "Sunshine Hotel Singapore has an outdoor swimming pool with a dedicated children’s area."
+    },
+    {
+        "id": "gym",
+        "text": "A fitness center is available for in-house guests. Operating hours may vary by day."
+    },
+    {
+        "id": "business_center",
+        "text": "A business corner is available with basic printing and computer access, subject to availability."
+    },
+    {
+        "id": "parking",
+        "text": "Limited parking may be available on-site or nearby. Availability and fees depend on local arrangements."
+    },
+    {
+        "id": "laundry_service",
+        "text": "Laundry and dry-cleaning services are available for an additional charge."
+    },
+    {
+        "id": "luggage_storage",
+        "text": "Luggage storage is available before check-in and after check-out, subject to space availability."
+    },
+    {
+        "id": "accessible_facilities",
+        "text": "Accessible facilities are available. Please contact the hotel in advance to confirm specific requirements."
+    },
+    {
+        "id": "elevator",
+        "text": "Elevators are available for guest access to all floors."
+    },
+    {
+        "id": "currency_exchange",
+        "text": "Currency exchange services may be available nearby. The front desk can advise on the closest options."
+    },
+    {
+        "id": "water_dispenser",
+        "text": "Water refill points may be available in common areas, depending on floor and building layout."
+    },
+    {
+        "id": "ice_machine",
+        "text": "Ice may be requested through room service or the front desk, subject to availability."
+    },
+    {
+        "id": "breakfast_hours",
+        "text": "Breakfast is served daily from 6:30 AM to 10:30 AM at the main restaurant."
+    },
+    {
+        "id": "breakfast_included",
+        "text": "Whether breakfast is included depends on your booking plan. Please check your confirmation or ask the front desk."
+    },
+    {
+        "id": "restaurant_cuisine",
+        "text": "The restaurant serves a selection of local Singaporean dishes and international cuisine."
+    },
+    {
+        "id": "room_service",
+        "text": "Room service may be available during selected hours. Please check the in-room menu or ask the front desk."
+    },
+    {
+        "id": "halal_options",
+        "text": "Halal-friendly options may be available. Please inform staff about dietary requirements."
+    },
+    {
+        "id": "vegetarian_options",
+        "text": "Vegetarian options are available in the restaurant. Vegan options may be available upon request."
+    },
+    {
+        "id": "allergy_notice",
+        "text": "Please inform the hotel of any allergies. We will do our best to accommodate, but we cannot guarantee an allergen-free environment."
+    },
+    {
+        "id": "late_night_food",
+        "text": "Late-night dining options may be limited. The front desk can recommend nearby alternatives."
+    },
+    {
+        "id": "kids_menu",
+        "text": "A children’s menu may be available depending on the day and outlet operations."
+    },
+    {
+        "id": "coffee_tea",
+        "text": "Coffee and tea are available at the restaurant and may also be provided in-room."
+    },
+    {
+        "id": "cancellation_policy",
+        "text": "Cancellation policies depend on the specific booking type. Please refer to your reservation confirmation for details."
+    },
+    {
+        "id": "refund_policy",
+        "text": "Refunds are processed according to the applicable cancellation policy of the booking."
+    },
+    {
+        "id": "no_show_policy",
+        "text": "No-show policies vary by booking type and rate plan. Please check your booking confirmation."
+    },
+    {
+        "id": "pet_policy",
+        "text": "Pets are generally not permitted unless explicitly stated in your booking plan or local service policy."
+    },
+    {
+        "id": "age_policy",
+        "text": "Guests under 18 must typically be accompanied by a parent or guardian, subject to hotel policy and local regulations."
+    },
+    {
+        "id": "id_requirement",
+        "text": "A valid photo ID and the payment method used for booking may be required at check-in."
+    },
+    {
+        "id": "damage_policy",
+        "text": "Guests may be charged for damages beyond normal wear and tear, in accordance with hotel policy."
+    },
+    {
+        "id": "noise_policy",
+        "text": "Please keep noise to a reasonable level, especially during quiet hours, to ensure a comfortable stay for all guests."
+    },
+    {
+        "id": "visitor_policy",
+        "text": "Visitor access to guest rooms may be subject to registration and hotel policy. Please check with the front desk."
+    },
+    {
+        "id": "durian_policy",
+        "text": "For guest comfort, strongly scented foods (including durian) may be restricted in guestrooms and indoor areas."
+    },
+    {
+        "id": "airport_transfer",
+        "text": "Airport transfer arrangements may be available through third-party providers. Please contact the front desk for options and pricing."
+    },
+    {
+        "id": "taxi_booking",
+        "text": "The front desk can assist with taxi bookings."
+    },
+    {
+        "id": "public_transport",
+        "text": "The hotel is accessible by public transport. The front desk can advise on the nearest MRT/bus options."
+    },
+    {
+        "id": "nearby_attractions",
+        "text": "Sunshine Hotel Singapore is close to major shopping and dining areas. Ask the front desk for recommended attractions nearby."
+    },
+    {
+        "id": "late_arrival",
+        "text": "If you expect to arrive late, please inform the hotel to help secure your reservation and check-in arrangements."
+    },
+    {
+        "id": "security",
+        "text": "The hotel has 24-hour security measures and controlled access to guest floors."
+    },
+    {
+        "id": "emergency_procedures",
+        "text": "Emergency exits and procedures are posted on each floor. Please review the information behind your room door."
+    },
+    {
+        "id": "medical_assistance",
+        "text": "If you require medical assistance, contact the front desk immediately. They can help arrange local services."
+    },
+    {
+        "id": "lost_and_found",
+        "text": "For lost-and-found inquiries, contact the front desk with as much detail as possible."
+    },
+    {
+        "id": "wifi_password",
+        "text": "Wi‑Fi password / login details are provided at check‑in or displayed in your room. If you need the Wi‑Fi password, please contact the front desk."
+    },
+    {
+        "id": "wifi_speed",
+        "text": "Hotel Wi‑Fi speed varies by location and usage. Complimentary high‑speed Wi‑Fi is provided; contact the front desk if you experience slow Wi‑Fi."
+    },
+    {
+        "id": "wired_internet",
+        "text": "Wired internet may not be available in all rooms. Please check with the front desk if you require a wired connection."
+    },
+    {
+        "id": "do_not_disturb",
+        "text": "If you place the 'Do Not Disturb' sign, housekeeping will not enter unless required for safety or policy reasons."
+    },
+    {
+        "id": "extra_towels",
+        "text": "Extra towels can be requested from housekeeping or the front desk, subject to availability."
+    },
+    {
+        "id": "pillow_options",
+        "text": "Additional pillows may be requested, subject to availability."
+    },
+    {
+        "id": "turn_down_service",
+        "text": "Turn-down service may be available for certain room categories or upon request."
+    },
+    {
+        "id": "kids_facilities",
+        "text": "Family-friendly amenities may be available. Please ask the front desk for current offerings and availability."
+    },
+    {
+        "id": "stroller_storage",
+        "text": "Stroller storage can often be accommodated. Please contact the front desk for assistance."
+    },
+    {
+        "id": "high_chair",
+        "text": "High chairs may be available in the restaurant, subject to availability."
+    },
+    {
+        "id": "meeting_rooms",
+        "text": "Meeting rooms may be available for corporate or private functions. Please contact the hotel for capacity and rates."
+    },
+    {
+        "id": "wedding_inquiries",
+        "text": "For wedding and event inquiries, please email reservations with your preferred dates and requirements."
+    },
+    {
+        "id": "banquet_options",
+        "text": "Banquet and catering options may be available. Availability depends on event schedule and staffing."
+    },
+    {
+        "id": "toiletries",
+        "text": "Basic toiletries are provided. Additional items may be available upon request, subject to stock."
+    },
+    {
+        "id": "slippers",
+        "text": "Slippers are provided in most rooms, or can be requested from housekeeping."
+    },
+    {
+        "id": "bathrobes",
+        "text": "Bathrobes may be available in selected room types. Please contact the front desk if you need one."
+    },
+    {
+        "id": "charging_cables",
+        "text": "Charging cables may be available for loan at the front desk, subject to availability."
+    },
+    {
+        "id": "wheelchair_access",
+        "text": "Wheelchair access is available in common areas. Please contact us in advance to confirm room accessibility features."
+    },
+    {
+        "id": "hearing_assistance",
+        "text": "If you need hearing-assistance features, please inform the hotel in advance so we can advise availability."
+    },
+    {
+        "id": "service_animals",
+        "text": "Service animals may be accommodated in accordance with local guidance. Please contact the hotel to confirm."
+    },
+    {
+        "id": "sustainability",
+        "text": "Sunshine Hotel supports sustainability initiatives such as towel/linen reuse and energy-efficient operations."
+    },
+    {
+        "id": "group_bookings",
+        "text": "For group bookings, please contact reservations with dates, room count, and any special requirements."
+    },
+    {
+        "id": "rate_change",
+        "text": "Rates can vary by date and availability. The hotel cannot guarantee a rate change unless stated in your booking terms."
+    },
+    {
+        "id": "extension_stay",
+        "text": "To extend your stay, please contact the front desk early to check availability and confirm rates."
+    },
+    {
+        "id": "directions_airport",
+        "text": "The front desk can help with directions to airport, including public transport and taxi options."
+    },
+    {
+        "id": "directions_city",
+        "text": "The front desk can help with directions to city, including public transport and taxi options."
+    },
+    {
+        "id": "directions_island",
+        "text": "The front desk can help with directions to island, including public transport and taxi options."
+    },
+    {
+        "id": "directions_night_safari",
+        "text": "The front desk can help with directions to Night Safari, including public transport and taxi options."
+    },
+    {
+        "id": "directions_zoo",
+        "text": "The front desk can help with directions to Singapore Zoo, including public transport and taxi options."
+    },
+    {
+        "id": "directions_gardens",
+        "text": "The front desk can help with directions to Gardens by the Bay, including public transport and taxi options."
+    },
+    {
+        "id": "directions_sentosa",
+        "text": "The front desk can help with directions to Sentosa, including public transport and taxi options."
+    },
+    {
+        "id": "dining_singaporean_options",
+        "text": "For local Singaporean food (e.g., hawker centres, chilli crab), ask the front desk for nearby recommendations."
+    },
+    {
+        "id": "dining_chinese_options",
+        "text": "For Chinese food (e.g., dim sum, noodles), ask the front desk for nearby restaurant recommendations."
+    },
+    {
+        "id": "dining_indian_options",
+        "text": "For Indian food (e.g., curry, biryani, tandoori), ask the front desk for nearby restaurant recommendations."
+    },
+    {
+        "id": "dining_western_options",
+        "text": "For Western food (e.g., steak, pasta), ask the front desk for nearby restaurant recommendations."
+    },
+    {
+        "id": "dining_japanese_options",
+        "text": "For Japanese food (e.g., sushi, ramen), ask the front desk for nearby restaurant recommendations."
+    },
+    {
+        "id": "dining_thai_options",
+        "text": "For Thai food (e.g., tom yum, pad thai), ask the front desk for nearby restaurant recommendations."
+    },
+    {
+        "id": "pool_hours",
+        "text": "Swimming pool operating hours may vary. Please check the signage at the pool or confirm with the front desk."
+    },
+    {
+        "id": "pool_towels",
+        "text": "Pool towels may be provided at the pool area or can be requested. Please return towels after use."
+    },
+    {
+        "id": "gym_age_policy",
+        "text": "Fitness center access may be restricted for minors. Please check with the front desk for the current policy."
+    },
+    {
+        "id": "nearby_pharmacy",
+        "text": "The front desk can advise on the nearest pharmacy and the best way to get there."
+    },
+    {
+        "id": "nearby_clinic",
+        "text": "The front desk can advise on the nearest clinic and the best way to get there."
+    },
+    {
+        "id": "nearby_atm",
+        "text": "The front desk can advise on the nearest ATM and the best way to get there."
+    },
+    {
+        "id": "nearby_supermarket",
+        "text": "The front desk can advise on the nearest supermarket and the best way to get there."
+    },
+    {
+        "id": "nearby_laundromat",
+        "text": "The front desk can advise on the nearest laundromat and the best way to get there."
+    },
+    {
+        "id": "nearby_post_office",
+        "text": "The front desk can advise on the nearest post office and the best way to get there."
+    },
+    {
+        "id": "printing",
+        "text": "Basic printing may be available at the front desk or business corner, subject to availability and policy."
+    },
+    {
+        "id": "parcel_handling",
+        "text": "Small parcels may be received for in-house guests. Please label items clearly with your name and arrival date."
+    },
+    {
+        "id": "wake_up_call",
+        "text": "Wake-up call service is available. Please request it via the front desk."
+    },
+    {
+        "id": "late_night_checkin",
+        "text": "Late-night check-in is available. Please inform the hotel if you expect to arrive after midnight."
+    },
+    {
+        "id": "privacy_policy",
+        "text": "Guest information is handled according to applicable privacy requirements. Please contact the hotel for formal privacy policy details."
+    },
+    {
+        "id": "cctv",
+        "text": "CCTV may be used in public areas for safety and security purposes."
+    },
+    {
+        "id": "amenity_toothbrush",
+        "text": "Toothbrush kits may be provided on request. Please contact the front desk or housekeeping."
+    },
+    {
+        "id": "amenity_razor",
+        "text": "Shaving kits may be provided on request. Please contact the front desk or housekeeping."
+    },
+    {
+        "id": "amenity_sewing_kit",
+        "text": "A sewing kit may be available on request. Please contact the front desk or housekeeping."
+    },
+    {
+        "id": "amenity_shower_cap",
+        "text": "Shower caps may be available on request. Please contact the front desk or housekeeping."
+    },
+    {
+        "id": "amenity_earplugs",
+        "text": "Earplugs may be available on request, subject to stock. Please contact the front desk or housekeeping."
+    },
+    {
+        "id": "amenity_umbrella",
+        "text": "Umbrellas may be available for loan during rainy weather, subject to availability. Please contact the front desk or housekeeping."
+    },
+    {
+        "id": "amenity_water_bottles",
+        "text": "Complimentary water may be provided daily, depending on room type and policy. Please contact the front desk or housekeeping."
+    },
+    {
+        "id": "policy_late_payment",
+        "text": "If a payment issue occurs, the front desk will contact you to resolve it promptly."
+    },
+    {
+        "id": "policy_keycard",
+        "text": "If you lose your key card, please visit the front desk for a replacement. Identity verification may be required."
+    },
+    {
+        "id": "policy_non_refundable",
+        "text": "Non-refundable bookings generally cannot be refunded. Please refer to your booking terms for details."
+    },
+    {
+        "id": "policy_third_party_booking",
+        "text": "For bookings made through third-party platforms, some changes may need to be processed through the platform."
+    },
+    {
+        "id": "room_feature_aircon",
+        "text": "Air conditioning is available in guestrooms. If you need assistance adjusting it, please contact the front desk."
+    },
+    {
+        "id": "room_feature_tv",
+        "text": "Most rooms include a TV with local and selected international channels."
+    },
+    {
+        "id": "room_feature_streaming",
+        "text": "Streaming availability depends on the room TV system. You may use your own device where supported."
+    },
+    {
+        "id": "room_feature_usb_ports",
+        "text": "USB charging ports may be available in some rooms; otherwise, standard power outlets can be used."
+    },
+    {
+        "id": "room_feature_blackout_curtains",
+        "text": "Blackout curtains are available in most guestrooms."
+    },
+    {
+        "id": "room_feature_soundproofing",
+        "text": "Rooms are designed for comfort; however, noise levels can vary. Earplugs may be requested if needed."
+    },
+    {
+        "id": "service_tour_desk",
+        "text": "The front desk can assist with basic tour information and recommendations."
+    },
+    {
+        "id": "service_car_rental",
+        "text": "Car rental arrangements can be made through third-party providers; please contact the front desk."
+    },
+    {
+        "id": "service_babysitting",
+        "text": "Babysitting services may not be available at all times; please check with the front desk."
+    },
+    {
+        "id": "service_massage",
+        "text": "In-room massage services may be available through third-party providers; availability may vary."
+    },
+    {
+        "id": "checkin_documents",
+        "text": "Please bring a valid photo ID and the payment method used for booking (or a guarantee method), as these may be required at check-in."
+    },
+    {
+        "id": "late_checkout_fee",
+        "text": "If approved, late check-out may incur a fee depending on the requested time and occupancy. Please confirm with the front desk on the day."
+    },
+    {
+        "id": "early_checkin_fee",
+        "text": "If approved, early check-in may incur a fee depending on arrival time and availability. Please confirm with the front desk on arrival."
+    },
+    {
+        "id": "special_requests",
+        "text": "Special requests (such as high floor or away from elevators) are subject to availability and cannot be guaranteed."
+    }
+]
