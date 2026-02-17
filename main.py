@@ -180,3 +180,8 @@ def tts(req: TTSRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS error: {e}")
+
+
+@app.get("/version")
+def version():
+    return {"version": "CI/CD test working 🎉"}
