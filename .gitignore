@@ -1,0 +1,17 @@
+﻿# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Local caches
+.cache/
+rag_store/
+
+# Secrets (NEVER commit)
+.env
+openai_key.txt
+github-deployer-key.json
+
+# Logs / OS junk
+*.log
+.DS_Store
