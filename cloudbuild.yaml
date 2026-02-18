@@ -40,3 +40,6 @@ substitutions:
   _REPO: "hotel-voice-agent-repo"
   _IMAGE: "hotel-voice-agent-backend"
   _SERVICE: "hotel-voice-agent-backend"
+  options:
+  logging: CLOUD_LOGGING_ONLY
+
