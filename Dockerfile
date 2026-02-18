@@ -2,16 +2,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Install system deps (optional but helpful for some wheels)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+ && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# Python deps first for better layer caching
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# App source
+COPY . /app
 
-# Optional but nice for clarity:
+# Cloud Run listens on $PORT (default 8080)
 EXPOSE 8080
+ENV PYTHONUNBUFFERED=1
 
-# Cloud Run provides PORT env var (usually 8080). We honor it.
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

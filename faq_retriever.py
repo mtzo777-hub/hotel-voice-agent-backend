@@ -1,233 +1,282 @@
+"""
+FAQ Retriever
+
+Option B (best-practice for ops/maintenance):
+- Prefer a prebuilt local retrieval store (FAISS artifacts under ./rag_store) if it exists.
+- Fall back to a lightweight lexical retriever using faq.json when the store is missing.
+
+This makes deployments resilient: the service still answers even if vector artifacts are absent.
+"""
+
+from __future__ import annotations
+
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
-
-import numpy as np
-import faiss
-
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+from typing import Any, Dict, List, Optional, Tuple
 
 
-# ----------------------------
-# Config
-# ----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-EMBED_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL",
-                        "text-embedding-3-small").strip()
+# ---------- Data loading helpers ----------
 
-BASE_DIR = Path(__file__).resolve().parent
-STORE_DIR = BASE_DIR / "rag_store"
-INDEX_PATH = STORE_DIR / "faq.index"
-TEXTS_PATH = STORE_DIR / "faq_texts.json"
-META_PATH = STORE_DIR / "faq_meta.json"
-
-DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "5"))
-DEFAULT_MIN_SCORE = float(os.getenv("DEFAULT_MIN_SCORE", "0.35"))
+def _read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def _l2_normalize(x: np.ndarray) -> np.ndarray:
-    if x.ndim == 1:
-        x = x.reshape(1, -1)
-    denom = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
-    return x / denom
+def _normalize_faq_items(raw: Any) -> List[Dict[str, str]]:
+    """Try to normalize various faq.json shapes into a list of {question, answer}."""
+    if raw is None:
+        return []
+
+    # common shapes:
+    # 1) [ {"question":..., "answer":...}, ... ]
+    if isinstance(raw, list):
+        items = raw
+    # 2) {"faqs": [...]}
+    elif isinstance(raw, dict) and isinstance(raw.get("faqs"), list):
+        items = raw["faqs"]
+    # 3) {"data": [...]}
+    elif isinstance(raw, dict) and isinstance(raw.get("data"), list):
+        items = raw["data"]
+    else:
+        return []
+
+    out: List[Dict[str, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        q = (it.get("question") or it.get("q")
+             or it.get("title") or "").strip()
+        a = (it.get("answer") or it.get("a") or it.get("text") or "").strip()
+        if q and a:
+            out.append({"question": q, "answer": a})
+    return out
 
 
-def _norm_text(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = s.replace("-", " ")
-
-    # normalize "check in"/"check-out" variants
-    s = re.sub(r"\bcheck\s+in_", "checkin_", s)
-    s = re.sub(r"\bcheck\s+out_", "checkout_", s)
-    s = re.sub(r"\bcheck\s+in\b", "checkin", s)
-    s = re.sub(r"\bcheck\s+out\b", "checkout", s)
-
-    # remove punctuation, keep underscore
-    s = re.sub(r"[^\w\s_]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+_WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 
 
-def _to_id_like(s: str) -> str:
-    s = _norm_text(s).replace(" ", "_")
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s
+def _tokenize(text: str) -> List[str]:
+    return _WORD_RE.findall(text.lower())
 
 
-def _token_set(s: str) -> set[str]:
-    s = _norm_text(s)
-    return {t for t in s.split(" ") if t}
+def _lexical_score(query: str, question: str) -> float:
+    """Simple, dependency-free score in [0, 1]."""
+    q_tokens = set(_tokenize(query))
+    s_tokens = set(_tokenize(question))
+    if not q_tokens or not s_tokens:
+        return 0.0
+
+    overlap = len(q_tokens & s_tokens)
+    jacc = overlap / max(1, len(q_tokens | s_tokens))
+
+    # small bonus for substring match
+    q_norm = " ".join(_tokenize(query))
+    s_norm = " ".join(_tokenize(question))
+    substr = 1.0 if q_norm and q_norm in s_norm else 0.0
+
+    # weighted blend
+    score = 0.85 * jacc + 0.15 * substr
+    return max(0.0, min(1.0, score))
 
 
-# ----------------------------
-# Retriever
-# ----------------------------
+# ---------- Retriever ----------
+
+@dataclass
+class RetrievalResult:
+    answer: str
+    matched: bool
+    best_score: float
+    top: List[Dict[str, Any]]
+    error: Optional[str] = None
+
+
 class FAQRetriever:
-    """
-    Cloud Run-safe retriever:
-    - Never crashes the container at import time.
-    - If dependencies are missing (rag_store / OPENAI_API_KEY), it returns clean errors at request time.
-    """
+    """Unified retriever with graceful fallback."""
 
-    def __init__(self) -> None:
-        self.ready: bool = True
-        self.init_error: Optional[str] = None
+    def __init__(
+        self,
+        faq_json_path: str = "faq.json",
+        rag_store_dir: str = "rag_store",
+    ) -> None:
+        self.faq_json_path = Path(faq_json_path)
+        self.rag_store_dir = Path(rag_store_dir)
 
-        self.index = None
-        self.texts: List[str] = []
-        self.meta: List[Dict[str, Any]] = []
-        self.id_map: Dict[str, Tuple[str, int]] = {}
-        self._text_tokens: List[set[str]] = []
+        self._faqs: List[Dict[str, str]] = []
+        self._faiss_ready = False
+        self._faiss_error: Optional[str] = None
 
-        missing = [p for p in [INDEX_PATH,
-                               TEXTS_PATH, META_PATH] if not p.exists()]
-        if missing:
-            self.ready = False
-            self.init_error = (
-                "RAG store missing. Ensure rag_store is packaged in the image.\n"
-                "Missing:\n" + "\n".join([f"- {p}" for p in missing])
-            )
-            return
+        # load lexical FAQ data (always)
+        self._load_faq_json()
 
-        try:
-            self.index = faiss.read_index(str(INDEX_PATH))
+        # try loading vector store if present
+        self._try_load_faiss_store()
 
-            with open(TEXTS_PATH, "r", encoding="utf-8") as f:
-                self.texts = json.load(f)
+    @property
+    def ready(self) -> bool:
+        # "ready" means we can answer using *either* method
+        return bool(self._faqs) or self._faiss_ready
 
-            with open(META_PATH, "r", encoding="utf-8") as f:
-                self.meta = json.load(f)
-
-            for i, m in enumerate(self.meta):
-                faq_id = str(m.get("id", "")).strip()
-                if faq_id:
-                    self.id_map[faq_id.lower()] = (self.texts[i], i)
-
-            self._text_tokens = [_token_set(t) for t in self.texts]
-
-        except Exception as e:
-            self.ready = False
-            self.init_error = f"Failed to load RAG store: {str(e)}"
-
-    def _get_openai_client(self) -> Optional["OpenAI"]:
-        if not OPENAI_API_KEY:
-            return None
-        if OpenAI is None:
-            return None
-        return OpenAI(api_key=OPENAI_API_KEY)
-
-    def _embed_query(self, q: str) -> np.ndarray:
-        client = self._get_openai_client()
-        if client is None:
-            raise RuntimeError(
-                "OPENAI_API_KEY missing or OpenAI SDK unavailable; cannot embed query.")
-        emb = client.embeddings.create(model=EMBED_MODEL, input=q)
-        vec = np.array(emb.data[0].embedding, dtype=np.float32)
-        return _l2_normalize(vec)
-
-    def _faiss_search(self, qvec: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
-        assert self.index is not None
-        scores, idxs = self.index.search(qvec.astype(np.float32), top_k)
-        return scores[0], idxs[0]
-
-    def _simple_overlap_score(self, q_tokens: set[str], doc_tokens: set[str]) -> float:
-        if not q_tokens or not doc_tokens:
-            return 0.0
-        inter = len(q_tokens.intersection(doc_tokens))
-        return inter / (len(q_tokens) + 1e-9)
-
-    def _exact_id_match(self, q: str) -> Tuple[bool, Dict[str, Any]]:
-        qn = _norm_text(q)
-        id_like = _to_id_like(q)
-
-        tokens = set(re.findall(r"[a-z0-9_]+", qn))
-        for t in tokens:
-            if t in self.id_map:
-                text, _ = self.id_map[t]
-                return True, {
-                    "answer": text,
-                    "matched": True,
-                    "best_score": 1.0,
-                    "top": [{"score": 1.0, "id": t, "text": text}],
-                }
-
-        if id_like in self.id_map:
-            text, _ = self.id_map[id_like]
-            return True, {
-                "answer": text,
-                "matched": True,
-                "best_score": 1.0,
-                "top": [{"score": 1.0, "id": id_like, "text": text}],
-            }
-
-        return False, {}
-
-    def search(self, query: str, top_k: int | None = None, min_score: float | None = None) -> Dict[str, Any]:
-        q = (query or "").strip()
-        if not q:
-            return {"answer": "Please ask a question about the hotel.", "matched": False, "best_score": 0.0, "top": []}
-
-        if not self.ready:
-            return {
-                "answer": "Retriever is not ready.",
-                "matched": False,
-                "best_score": 0.0,
-                "top": [],
-                "error": self.init_error or "Unknown initialization error",
-            }
-
-        top_k = int(top_k if top_k is not None else DEFAULT_TOP_K)
-        top_k = max(1, min(top_k, 10))
-        min_score = float(
-            min_score if min_score is not None else DEFAULT_MIN_SCORE)
-
-        # 1) exact id match first
-        matched, payload = self._exact_id_match(q)
-        if matched:
-            return payload
-
-        # 2) vector search
-        qvec = self._embed_query(q)
-        scores, idxs = self._faiss_search(qvec, top_k=top_k)
-
-        q_tokens = _token_set(q)
-        candidates: List[Dict[str, Any]] = []
-
-        for score, idx in zip(scores.tolist(), idxs.tolist()):
-            if idx < 0 or idx >= len(self.texts):
-                continue
-            meta = self.meta[idx] if idx < len(self.meta) else {}
-            faq_id = str(meta.get("id", "")).strip() or f"row_{idx}"
-            text = self.texts[idx]
-
-            overlap = self._simple_overlap_score(
-                q_tokens, self._text_tokens[idx])
-            blended = float(score) * 0.85 + float(overlap) * 0.15
-
-            candidates.append({"score": blended, "id": faq_id, "text": text})
-
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-
-        best = candidates[0] if candidates else None
-        if not best or best["score"] < min_score:
-            return {
-                "answer": "Sorry — I can’t find that information in the hotel FAQ.",
-                "matched": False,
-                "best_score": float(best["score"]) if best else 0.0,
-                "top": candidates,
-            }
-
+    @property
+    def status(self) -> Dict[str, Any]:
         return {
-            "answer": best["text"],
-            "matched": True,
-            "best_score": float(best["score"]),
-            "top": candidates,
+            "lexical_loaded": bool(self._faqs),
+            "faiss_loaded": self._faiss_ready,
+            "faiss_error": self._faiss_error,
+            "faq_count": len(self._faqs),
+            "rag_store_dir": str(self.rag_store_dir.resolve()),
+            "faq_json_path": str(self.faq_json_path.resolve()),
         }
+
+    def _load_faq_json(self) -> None:
+        try:
+            # allow relative paths (repo root)
+            if not self.faq_json_path.exists():
+                # also try /app/faq.json in container
+                alt = Path("/app") / self.faq_json_path.name
+                if alt.exists():
+                    self.faq_json_path = alt
+
+            raw = _read_json(self.faq_json_path)
+            self._faqs = _normalize_faq_items(raw)
+        except Exception as e:
+            self._faqs = []
+            # don't fail hard; fallback might still work via FAISS
+            self._faiss_error = f"Failed to read faq.json: {e}"
+
+    def _try_load_faiss_store(self) -> None:
+        """Optional: load FAISS artifacts if they exist."""
+        try:
+            expected = [
+                self.rag_store_dir / "faq.index",
+                self.rag_store_dir / "faq_texts.json",
+                self.rag_store_dir / "faq_meta.json",
+            ]
+            if not all(p.exists() for p in expected):
+                missing = [str(p) for p in expected if not p.exists()]
+                self._faiss_ready = False
+                self._faiss_error = (
+                    "RAG store missing. Using lexical fallback. Missing:\n- " +
+                    "\n- ".join(missing)
+                )
+                return
+
+            # Lazy import so deployments work even if faiss isn't installed
+            import faiss  # type: ignore
+
+            with (self.rag_store_dir / "faq_texts.json").open("r", encoding="utf-8") as f:
+                self._texts = json.load(f)  # list[str]
+            with (self.rag_store_dir / "faq_meta.json").open("r", encoding="utf-8") as f:
+                self._meta = json.load(f)  # list[dict]
+            self._index = faiss.read_index(
+                str(self.rag_store_dir / "faq.index"))
+
+            # embeddings must match whatever built the index; we only use the store if embeddings are available
+            from openai import OpenAI  # type: ignore
+
+            self._openai = OpenAI()
+            self._faiss_ready = True
+            self._faiss_error = None
+        except Exception as e:
+            self._faiss_ready = False
+            self._faiss_error = f"FAISS load failed. Using lexical fallback. Reason: {e}"
+
+    def answer(self, query: str, top_k: int = 5, min_score: float = 0.35) -> RetrievalResult:
+        query = (query or "").strip()
+        if not query:
+            return RetrievalResult(
+                answer="Please provide a question.",
+                matched=False,
+                best_score=0.0,
+                top=[],
+                error="Empty query",
+            )
+
+        # 1) Try FAISS if available
+        if self._faiss_ready:
+            try:
+                emb = self._openai.embeddings.create(
+                    model=os.getenv("OPENAI_EMBED_MODEL",
+                                    "text-embedding-3-small"),
+                    input=query,
+                )
+                vec = emb.data[0].embedding
+
+                import numpy as np  # type: ignore
+
+                xq = np.array([vec], dtype="float32")
+                D, I = self._index.search(xq, top_k)
+
+                # Convert distances to a similarity-ish score (monotonic)
+                scored: List[Tuple[int, float]] = []
+                for idx, dist in zip(I[0].tolist(), D[0].tolist()):
+                    if idx < 0:
+                        continue
+                    score = 1.0 / (1.0 + float(dist))
+                    scored.append((idx, score))
+
+                top: List[Dict[str, Any]] = []
+                best_score = 0.0
+                best_answer = ""
+
+                for idx, score in scored:
+                    meta = self._meta[idx] if idx < len(self._meta) else {}
+                    text = self._texts[idx] if idx < len(self._texts) else ""
+                    top.append({"score": score, "text": text, "meta": meta})
+                    if score > best_score:
+                        best_score = score
+                        best_answer = meta.get("answer") or text or ""
+
+                matched = best_score >= float(min_score)
+                return RetrievalResult(
+                    answer=best_answer if matched else "No confident match found.",
+                    matched=matched,
+                    best_score=best_score,
+                    top=top,
+                    error=None,
+                )
+            except Exception as e:
+                # fall through to lexical
+                faiss_err = f"Vector retrieval error; falling back to lexical. Reason: {e}"
+        else:
+            faiss_err = None
+
+        # 2) Lexical fallback
+        if not self._faqs:
+            return RetrievalResult(
+                answer="Retriever is not ready.",
+                matched=False,
+                best_score=0.0,
+                top=[],
+                error=faiss_err or self._faiss_error or "FAQ data not available",
+            )
+
+        scored = []
+        for item in self._faqs:
+            score = _lexical_score(query, item["question"])
+            scored.append((score, item))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_items = scored[: max(1, top_k)]
+
+        best_score = float(top_items[0][0]) if top_items else 0.0
+        matched = best_score >= float(min_score)
+
+        top: List[Dict[str, Any]] = [
+            {"score": float(
+                s), "question": it["question"], "answer": it["answer"]}
+            for s, it in top_items
+        ]
+
+        answer = top_items[0][1]["answer"] if (
+            matched and top_items) else "No confident match found."
+
+        return RetrievalResult(
+            answer=answer,
+            matched=matched,
+            best_score=best_score,
+            top=top,
+            error=faiss_err or self._faiss_error,
+        )
