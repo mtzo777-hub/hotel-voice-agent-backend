@@ -1,5 +1,4 @@
 steps:
-  # Build the container image
   - name: gcr.io/cloud-builders/docker
     args:
       - build
@@ -7,13 +6,11 @@ steps:
       - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA"
       - .
 
-  # Push to Artifact Registry
   - name: gcr.io/cloud-builders/docker
     args:
       - push
       - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA"
 
-  # Deploy to Cloud Run
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
@@ -31,6 +28,9 @@ steps:
       - "8080"
       - "--timeout"
       - "300"
+      # ✅ stable secret mapping every deploy:
+      - "--set-secrets"
+      - "OPENAI_API_KEY=${_OPENAI_SECRET}:latest"
 
 images:
   - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA"
@@ -40,8 +40,10 @@ substitutions:
   _REPO: "hotel-voice-agent-repo"
   _IMAGE: "hotel-voice-agent-backend"
   _SERVICE: "hotel-voice-agent-backend"
+  _OPENAI_SECRET: "openai-api-key"
 
 options:
   logging: CLOUD_LOGGING_ONLY
+
   
 
