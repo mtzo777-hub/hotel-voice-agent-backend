@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,33 +6,34 @@ from pydantic import BaseModel, Field
 from faq_retriever import FAQRetriever
 
 APP_NAME = "Hotel Voice Agent Backend"
+APP_VERSION = "1.0.0"
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+FAQ_JSON_PATH = os.getenv("FAQ_JSON_PATH", "/app/faq.json")
 
-# Allow your GitHub Pages frontend (and local dev)
-allowed_origins = [
+# IMPORTANT:
+# Cloud Run sets PORT; default to 8080 for local/docker.
+PORT = int(os.getenv("PORT", "8080"))
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
+# CORS: allow your GitHub Pages frontend + local dev
+origins = [
     "https://mtzo777-hub.github.io",
-    "http://localhost",
     "http://localhost:3000",
-    "http://127.0.0.1",
     "http://127.0.0.1:3000",
+    "http://localhost:8501",
+    "http://127.0.0.1:8501",
 ]
-extra = os.getenv("CORS_ORIGINS", "").strip()
-if extra:
-    allowed_origins.extend([o.strip() for o in extra.split(",") if o.strip()])
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(dict.fromkeys(allowed_origins)),
-    allow_credentials=True,
+    allow_origins=origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-retriever = FAQRetriever(
-    faq_json_path=os.getenv("FAQ_JSON_PATH", "faq.json"),
-    rag_store_dir=os.getenv("RAG_STORE_DIR", "rag_store"),
-)
+# Single retriever instance
+retriever = FAQRetriever(faq_json_path=FAQ_JSON_PATH)
 
 
 class FAQRequest(BaseModel):
@@ -45,23 +44,27 @@ class FAQRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": APP_NAME, "docs": "/docs", "health": "/healthz"}
+    return {
+        "name": APP_NAME,
+        "version": APP_VERSION,
+        "docs": "/docs",
+        "health": "/health",
+        "healthz": "/healthz",
+    }
 
 
+# Keep BOTH paths so you can use either one
 @app.get("/health")
+def health():
+    return {"ok": True, "port": PORT, "retriever": retriever.status()}
+
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "retriever": retriever.status}
+    # Some tools expect /healthz specifically
+    return {"ok": True}
 
 
 @app.post("/faq/answer")
-def faq_answer(payload: FAQRequest):
-    result = retriever.answer(
-        payload.query, top_k=payload.top_k, min_score=payload.min_score)
-    return {
-        "answer": result.answer,
-        "matched": result.matched,
-        "best_score": result.best_score,
-        "top": result.top,
-        "error": result.error,
-    }
+def faq_answer(req: FAQRequest):
+    return retriever.answer(query=req.query, top_k=req.top_k, min_score=req.min_score)
