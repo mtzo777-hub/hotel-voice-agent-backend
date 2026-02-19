@@ -1,68 +1,58 @@
-"""
-main.py - FastAPI backend for Hotel Voice Agent
-
-Endpoints:
-- GET  /           : root
-- GET  /health     : health + retriever status
-- POST /faq/answer : query FAQ JSON via FAQRetriever
-
-Notes:
-- Cloud Run expects the container to listen on $PORT (default 8080).
-- We only keep /health (remove /healthz as requested).
-"""
-
 import os
+from typing import Optional
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from faq_retriever import FAQRetriever
 
-APP_NAME = "Hotel Voice Agent Backend"
-APP_VERSION = "1.0.0"
 
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+app = FastAPI(title="Hotel Voice Agent Backend", version="1.0.0")
 
-# CORS: allow your GitHub Pages frontend + local dev
-allowed_origins = [
-    "https://mtzo777-hub.github.io",
-    "http://localhost",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:5500",
-    "http://127.0.0.1:8000",
-]
-
+# Allow your GitHub Pages frontend + local dev.
+# If you want to be extra strict, keep only these origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=[
+        "https://mtzo777-hub.github.io",
+        "http://localhost",
+        "http://127.0.0.1",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-retriever = FAQRetriever()
+retriever = FAQRetriever(faq_json_path=os.getenv(
+    "FAQ_JSON_PATH", "/app/faq.json"))
 
 
 class FAQRequest(BaseModel):
     query: str = Field(..., title="Query", description="User question")
     top_k: int = Field(5, ge=1, le=20, title="Top K",
                        description="Top K results")
-    min_score: float = Field(0.35, ge=0.0, le=1.0, title="Min Score",
-                             description="Minimum score to accept match")
+    min_score: float = Field(
+        0.35, ge=0.0, le=1.0, title="Min Score", description="Minimum match score")
 
 
 @app.get("/")
 def root():
-    return {"message": APP_NAME, "version": APP_VERSION}
+    return {"ok": True, "service": "hotel-voice-agent-backend"}
 
 
 @app.get("/health")
 def health():
-    port = int(os.getenv("PORT", "8080"))
-    return {"ok": True, "port": port, "retriever": retriever.status()}
+    return {
+        "ok": True,
+        "port": int(os.getenv("PORT", "8080")),
+        "retriever": retriever.status(),
+    }
 
 
 @app.post("/faq/answer")
-def faq_answer(payload: FAQRequest):
-    return retriever.search(payload.query, top_k=payload.top_k, min_score=payload.min_score)
+def faq_answer(req: FAQRequest):
+    """
+    Main retrieval endpoint used by Swagger + your GitHub Pages frontend.
+    """
+    return retriever.answer(query=req.query, top_k=req.top_k, min_score=req.min_score)

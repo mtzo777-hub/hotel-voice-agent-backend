@@ -1,334 +1,286 @@
-"""
-faq_retriever.py
-
-Goal:
-- Fast, reliable FAQ retrieval from faq.json (packaged in the Docker image).
-- Works well even when user query wording doesn't exactly match the FAQ "id".
-- Avoids heavy dependencies (no FAISS / embeddings required).
-
-Approach:
-1) Intent routing (rules) for the most common mismatch queries (fees vs policies, address, etc.)
-2) Hybrid lexical ranking:
-   - Word-level TF-IDF (unigrams + bigrams)
-   - Character n-gram TF-IDF (handles typos like "message" vs "massage")
-   - Small boost using fuzzy match against FAQ ids
-"""
-
-from __future__ import annotations
-
 import json
+import math
 import os
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-
-from rapidfuzz import fuzz
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from collections import Counter
+from typing import Any, Dict, List, Optional
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-
-_WS_RE = re.compile(r"\s+")
-_NONWORD_RE = re.compile(r"[^a-z0-9\s]+")
-
-_COMMON_NORMALIZATIONS = [
-    (re.compile(r"\bcheck\s*[-]?\s*in\b", re.I), "checkin"),
-    (re.compile(r"\bcheck\s*[-]?\s*out\b", re.I), "checkout"),
-    (re.compile(r"\bwheel\s*chair\b", re.I), "wheelchair"),
-    (re.compile(r"\bwi\s*fi\b", re.I), "wifi"),
-]
-
-_SYNONYMS = {
-    "where": ["location", "address"],
-    "located": ["location", "address"],
-    "location": ["address"],
-    "address": ["location"],
-    "how much": ["price", "fee", "cost", "charge"],
-    "cost": ["price", "fee", "charge"],
-    "price": ["cost", "fee", "charge"],
-    "fee": ["price", "cost", "charge"],
-    "late checkout": ["checkout late", "late check out"],
-    "early checkin": ["checkin early", "early check in"],
-    "massage": ["spa", "treatment"],
-    "smoking": ["smoke", "cigarette", "vape"],
-    "soundproof": ["quiet", "noise", "noiseproof", "sound proof"],
-    "capacity": ["how many", "max people", "max persons", "occupancy"],
-    "visitor": ["guest", "visitors", "friends", "family"],
-    "accessible": ["wheelchair", "disabled", "accessibility"],
-}
-
-# quick typo fixes (only whole word replacement)
-_TYPO_FIXES = {
-    # typo seen in your logs
-    "message": "massage",
-    "adress": "address",
-    "chec in": "checkin",
-    "chec out": "checkout",
-}
+# Keep stopwords conservative to avoid breaking matches.
+STOPWORDS = set(
+    """
+a an the is are was were am be been being to of in on at for from by with as or and if then than
+i you we they he she it my your our their his her its me us them
+please tell give show explain
+sunshine
+""".split()
+)
 
 
-def _norm(text: str) -> str:
-    s = (text or "").strip().lower()
-
-    for bad, good in _TYPO_FIXES.items():
-        s = re.sub(rf"\b{re.escape(bad)}\b", good, s)
-
-    for pat, repl in _COMMON_NORMALIZATIONS:
-        s = pat.sub(repl, s)
-
-    s = _NONWORD_RE.sub(" ", s)
-    s = _WS_RE.sub(" ", s).strip()
+def _normalize_text(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"[’']", "", s)
+    s = re.sub(r"[^a-z0-9\s_-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def _id_tokens(faq_id: str) -> str:
-    # "late_checkout_fee" -> "late checkout fee"
-    return faq_id.replace("_", " ").strip().lower()
+def _tokenize(s: str) -> List[str]:
+    s = _normalize_text(s).replace("-", " ").replace("_", " ")
+    toks = [t for t in s.split() if t and t not in STOPWORDS]
+    return toks
 
 
-@dataclass
-class FAQDoc:
-    id: str
-    text: str
-    doc: str  # searchable document (id tokens + answer text)
+def _idify_query(q: str) -> str:
+    """
+    Convert a user query into an "id-like" string.
+    Example: "When is check-in time?" -> "check_in_time" (then we normalize to checkin_time if needed)
+    """
+    q = _normalize_text(q)
+    q = q.replace("-", " ")
+    q = re.sub(r"\?", "", q)
+    q = re.sub(r"\s+", " ", q).strip()
+
+    # Remove common leading question phrases (safe trimming)
+    q = re.sub(
+        r"^(what|when|where|how)\s+(is|are|do|does|can|could|should|would)\s+", "", q)
+    q = re.sub(r"^(what|when|where|how)\s+", "", q)
+
+    q = q.replace(" ", "_")
+    return q
+
+
+def _infer_id(query: str, idset: set) -> Optional[str]:
+    """
+    Very important: this is a "SAFE" mapping layer.
+    It only forces a specific ID when we are confident.
+    """
+    qn = _normalize_text(query)
+    qid = _idify_query(query)
+
+    candidates = [
+        qid,
+        re.sub(r"^the_", "", qid),
+        re.sub(r"^hotel_", "", qid),
+        re.sub(r"^the_hotel_", "", qid),
+    ]
+
+    # Normalize common check-in/out variants
+    candidates += [
+        qid.replace("check_in", "checkin").replace("check_out", "checkout"),
+        qid.replace("checkin", "check_in").replace("checkout", "check_out"),
+    ]
+
+    for c in candidates:
+        if c in idset:
+            return c
+
+    toks = set(_tokenize(query))
+
+    # Address / location intent → address
+    if ("address" in toks or "location" in toks or "located" in toks or "directions" in toks) and "address" in idset:
+        return "address"
+    if ("where" in qn and "hotel" in qn) and "address" in idset:
+        return "address"
+
+    # Check-in/out time intent
+    if ("check" in toks and "in" in toks and "time" in toks) and "checkin_time" in idset:
+        return "checkin_time"
+    if ("check" in toks and "out" in toks and "time" in toks) and "checkout_time" in idset:
+        return "checkout_time"
+
+    return None
+
+
+class _BM25Index:
+    def __init__(self, docs_tokens: List[List[str]], k1: float = 1.5, b: float = 0.75):
+        self.docs_tokens = docs_tokens
+        self.N = len(docs_tokens)
+        self.avgdl = (sum(len(d)
+                      for d in docs_tokens) / self.N) if self.N else 0.0
+
+        df = Counter()
+        for d in docs_tokens:
+            for t in set(d):
+                df[t] += 1
+        self.idf = {t: math.log(1 + (self.N - n + 0.5) / (n + 0.5))
+                    for t, n in df.items()}
+
+        self.k1 = k1
+        self.b = b
+
+    def score(self, query_tokens: List[str]) -> List[float]:
+        scores = [0.0] * self.N
+        if not query_tokens or self.N == 0:
+            return scores
+
+        qtf = Counter(query_tokens)
+
+        for i, doc in enumerate(self.docs_tokens):
+            dl = len(doc)
+            tf = Counter(doc)
+            denom_const = self.k1 * \
+                (1 - self.b + self.b * (dl / (self.avgdl or 1.0)))
+
+            s = 0.0
+            for t, _qt in qtf.items():
+                f = tf.get(t)
+                if not f:
+                    continue
+                idf = self.idf.get(t, 0.0)
+                s += idf * (f * (self.k1 + 1)) / (f + denom_const)
+
+            scores[i] = s
+
+        return scores
 
 
 class FAQRetriever:
-    def __init__(self, faq_json_path: Optional[str] = None):
-        self.faq_json_path = faq_json_path or os.getenv(
-            "FAQ_JSON_PATH", "/app/faq.json")
+    """
+    Stable retriever design (Option B best-practice for *your time constraint*):
+    - No vector store required
+    - Deterministic lexical retrieval (BM25)
+    - Exact ID / ID-like matching overrides ranking (critical)
+    - Minimal safe intent mapping for paraphrases
+    """
 
-        self._docs: List[FAQDoc] = []
-        self._word_vec: Optional[TfidfVectorizer] = None
-        self._char_vec: Optional[TfidfVectorizer] = None
-        self._word_X = None
-        self._char_X = None
+    def __init__(self, faq_json_path: str = "/app/faq.json"):
+        self.faq_json_path = faq_json_path
+        self.mode = "bm25_lexical"
 
-        self._ready: bool = False
-        self._error: Optional[str] = None
+        self._faq: List[Dict[str, str]] = []
+        self._idset: set = set()
+        self._doc_tokens: List[List[str]] = []
+        self._q_tokens: List[List[str]] = []
+        self._index: Optional[_BM25Index] = None
+
+        self.ready: bool = False
+        self.error: Optional[str] = None
 
         self._load()
 
-    def status(self) -> Dict[str, Any]:
-        return {
-            "ready": self._ready,
-            "mode": "hybrid_lexical",
-            "faq_json_path": self.faq_json_path,
-            "faq_count": len(self._docs),
-            "error": self._error,
-        }
-
     def _load(self) -> None:
         try:
-            if not os.path.exists(self.faq_json_path):
-                self._ready = False
-                self._error = f"faq.json not found at {self.faq_json_path}"
-                return
+            with open(self.faq_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
 
-            raw = json.loads(
-                open(self.faq_json_path, "r", encoding="utf-8").read())
-            docs: List[FAQDoc] = []
-            for item in raw:
-                faq_id = str(item.get("id", "")).strip()
-                text = str(item.get("text", "")).strip()
-                if not faq_id or not text:
+            faq: List[Dict[str, str]] = []
+            for it in data:
+                fid = str(it.get("id", "")).strip()
+                if not fid:
                     continue
-                doc = f"{_id_tokens(faq_id)}. {text}"
-                docs.append(FAQDoc(id=faq_id, text=text, doc=doc))
+                faq.append(
+                    {
+                        "id": fid,
+                        "question": str(it.get("question", "")).strip(),
+                        "answer": str(it.get("answer", "")).strip(),
+                    }
+                )
 
-            if not docs:
-                self._ready = False
-                self._error = "faq.json loaded but contained 0 valid Q/A pairs"
-                return
+            self._faq = faq
+            self._idset = set(x["id"] for x in self._faq)
 
-            self._docs = docs
+            # Index on (id words + question). Avoid indexing full answer (can cause false positives).
+            self._doc_tokens = [
+                _tokenize(x["id"].replace("_", " ") + " " + x.get("question", "")) for x in self._faq
+            ]
+            self._q_tokens = [_tokenize(x.get("question", ""))
+                              for x in self._faq]
 
-            self._word_vec = TfidfVectorizer(
-                lowercase=True,
-                ngram_range=(1, 2),
-                min_df=1,
-                stop_words="english",
-            )
-            self._char_vec = TfidfVectorizer(
-                lowercase=True,
-                analyzer="char_wb",
-                ngram_range=(3, 5),
-                min_df=1,
-            )
-
-            corpus = [d.doc for d in self._docs]
-            self._word_X = self._word_vec.fit_transform(corpus)
-            self._char_X = self._char_vec.fit_transform(corpus)
-
-            self._ready = True
-            self._error = None
-
+            self._index = _BM25Index(self._doc_tokens)
+            self.ready = True
+            self.error = None
         except Exception as e:
-            self._ready = False
-            self._error = f"Failed to load faq.json: {type(e).__name__}: {e}"
+            self.ready = False
+            self.error = f"{type(e).__name__}: {e}"
 
-    def _has_id(self, faq_id: str) -> bool:
-        return any(d.id == faq_id for d in self._docs)
+    def status(self) -> Dict[str, Any]:
+        return {
+            "ready": self.ready,
+            "mode": self.mode,
+            "faq_json_path": self.faq_json_path,
+            "faq_count": len(self._faq),
+            "error": self.error,
+        }
 
-    def _route(self, q_norm: str) -> Optional[str]:
-        """
-        Return FAQ id if a rule confidently matches; otherwise None.
-        These rules address the exact mismatch cases from your attached logs.
-        """
+    def _overlap_boost(self, q_set: set, doc_i: int) -> float:
+        if not q_set:
+            return 0.0
+        dt = set(self._q_tokens[doc_i]) if doc_i < len(
+            self._q_tokens) else set()
+        if not dt:
+            return 0.0
+        # fraction of query tokens appearing in the FAQ question
+        return len(q_set & dt) / max(1, len(q_set))
 
-        def has(*words: str) -> bool:
-            return all(w in q_norm for w in words)
-
-        # Address / location
-        if ("address" in q_norm) or has("where", "hotel") or ("located" in q_norm and "hotel" in q_norm):
-            return "address" if self._has_id("address") else None
-
-        # Hotel identity / name
-        if has("hotel", "name") or ("what is" in q_norm and "hotel" in q_norm and "called" in q_norm):
-            return "hotel_identity" if self._has_id("hotel_identity") else None
-
-        # Late checkout (fee vs policy)
-        if "late" in q_norm and "checkout" in q_norm:
-            if any(x in q_norm for x in ["how much", "price", "cost", "fee", "charge"]):
-                if self._has_id("late_checkout_fee"):
-                    return "late_checkout_fee"
-            if self._has_id("late_checkout_policy"):
-                return "late_checkout_policy"
-
-        # Early check-in (fee vs policy)
-        if "early" in q_norm and "checkin" in q_norm:
-            if any(x in q_norm for x in ["how much", "price", "cost", "fee", "charge"]):
-                if self._has_id("early_checkin_fee"):
-                    return "early_checkin_fee"
-            if self._has_id("early_checkin"):
-                return "early_checkin"
-
-        # Wheelchair / accessibility
-        if "wheelchair" in q_norm or "accessible" in q_norm or "accessibility" in q_norm or "disabled" in q_norm:
-            if self._has_id("wheelchair_access"):
-                return "wheelchair_access"
-
-        # Soundproof rooms
-        if "soundproof" in q_norm or "noiseproof" in q_norm or ("quiet" in q_norm and "room" in q_norm):
-            if self._has_id("room_feature_soundproofing"):
-                return "room_feature_soundproofing"
-
-        # Smoking policy
-        if "smoking" in q_norm or "smoke" in q_norm or "vape" in q_norm or "cigarette" in q_norm:
-            if self._has_id("smoking_policy"):
-                return "smoking_policy"
-
-        # Room capacity / max people
-        if any(x in q_norm for x in ["how many", "max", "maximum", "capacity", "occupancy", "persons", "people"]) and "room" in q_norm:
-            if self._has_id("room_capacity"):
-                return "room_capacity"
-
-        # Visitor policy
-        if any(x in q_norm for x in ["visitor", "visitors", "guest", "guests", "friends", "family"]) and any(
-            x in q_norm for x in ["allowed", "permit", "policy", "can i", "can we", "bring"]
-        ):
-            if self._has_id("visitor_policy"):
-                return "visitor_policy"
-
-        # No-show / cancellation
-        if "no" in q_norm and "show" in q_norm:
-            if self._has_id("no_show_policy"):
-                return "no_show_policy"
-
-        # Massage services (typo: "message")
-        if "massage" in q_norm or ("spa" in q_norm and "service" in q_norm):
-            if self._has_id("service_massage"):
-                return "service_massage"
-
-        return None
-
-    def _expand_query(self, q_norm: str) -> str:
-        expanded = [q_norm]
-        for k, syns in _SYNONYMS.items():
-            if k in q_norm:
-                expanded.extend(syns)
-        # dedupe but keep order
-        return " ".join(dict.fromkeys(expanded))
-
-    def _hybrid_rank(self, q_norm: str, top_k: int) -> List[Tuple[int, float]]:
-        if not self._ready or not self._docs:
-            return []
-
-        q_exp = self._expand_query(q_norm)
-
-        w = cosine_similarity(self._word_vec.transform(
-            [q_exp]), self._word_X).ravel()
-        c = cosine_similarity(self._char_vec.transform(
-            [q_exp]), self._char_X).ravel()
-
-        scores = 0.65 * w + 0.30 * c
-
-        for i, d in enumerate(self._docs):
-            idtok = _id_tokens(d.id)
-            f = fuzz.token_set_ratio(q_norm, idtok) / 100.0  # 0..1
-            scores[i] += 0.05 * f
-
-            # Bias fees when query asks "how much/price/cost"
-            if any(x in q_norm for x in ["how much", "price", "cost", "fee", "charge"]):
-                if d.id.endswith("_fee"):
-                    scores[i] += 0.03
-
-            # Bias policies if explicitly asks policy/rules
-            if "policy" in q_norm or "rule" in q_norm:
-                if "policy" in d.id:
-                    scores[i] += 0.03
-
-        idxs = scores.argsort()[::-1][: max(1, top_k)]
-        return [(int(i), float(scores[i])) for i in idxs]
-
-    def search(self, query: str, top_k: int = 5, min_score: float = 0.35) -> Dict[str, Any]:
-        q_norm = _norm(query)
-
-        if not self._ready:
+    def answer(self, query: str, top_k: int = 5, min_score: float = 0.35) -> Dict[str, Any]:
+        if not self.ready or not self._index:
             return {
                 "answer": "Retriever is not ready.",
                 "matched": False,
                 "best_score": 0.0,
                 "top": [],
-                "error": self._error or "Unknown error",
+                "error": self.error or "not_loaded",
             }
 
-        # 1) Rules first (fixes your fee/policy/address/massage mismatches)
-        routed_id = self._route(q_norm)
-        if routed_id:
-            d = next((x for x in self._docs if x.id == routed_id), None)
-            if d:
+        # 1) HARD OVERRIDE: exact ID / confident intent mapping
+        forced_id = _infer_id(query, self._idset)
+        if forced_id:
+            it = next((x for x in self._faq if x["id"] == forced_id), None)
+            if it:
                 return {
-                    "answer": d.text,
+                    "answer": it["answer"],
                     "matched": True,
                     "best_score": 1.0,
-                    "top": [{"id": d.id, "score": 1.0}],
+                    "top": [{"id": it["id"], "question": it["question"], "score": 1.0}],
                     "error": None,
                 }
 
-        # 2) Hybrid lexical ranking
-        ranked = self._hybrid_rank(q_norm, top_k=top_k)
-        top: List[Dict[str, Any]] = []
+        # 2) BM25 scoring
+        q_tokens = _tokenize(query)
+        if not q_tokens:
+            return {
+                "answer": "Please ask a question.",
+                "matched": False,
+                "best_score": 0.0,
+                "top": [],
+                "error": "empty_query_after_normalization",
+            }
 
-        best_doc = None
-        best_score = 0.0
+        raw_scores = self._index.score(q_tokens)
+        max_s = max(raw_scores) if raw_scores else 0.0
+        norm_scores = [(s / max_s) if max_s > 0 else 0.0 for s in raw_scores]
 
-        for idx, score in ranked:
-            d = self._docs[idx]
-            top.append({"id": d.id, "score": round(score, 4)})
-            if best_doc is None:
-                best_doc = d
-                best_score = score
+        q_set = set(q_tokens)
 
-        matched = bool(best_doc) and (best_score >= float(min_score))
+        # 3) Re-rank with small overlap boost (keeps old working queries stable)
+        ranked = sorted(
+            range(len(norm_scores)),
+            key=lambda i: (norm_scores[i] + 0.15 *
+                           self._overlap_boost(q_set, i)),
+            reverse=True,
+        )
+
+        ranked = ranked[: max(top_k, 10)]
+
+        top = []
+        for i in ranked[:top_k]:
+            top.append(
+                {
+                    "id": self._faq[i]["id"],
+                    "question": self._faq[i]["question"],
+                    "score": round(norm_scores[i], 4),
+                }
+            )
+
+        best_i = ranked[0]
+        best_score = norm_scores[best_i]
+        matched = best_score >= float(min_score)
 
         return {
-            "answer": best_doc.text if (best_doc and matched) else "No confident match found.",
+            "answer": self._faq[best_i]["answer"] if matched else "No confident match found.",
             "matched": matched,
-            "best_score": round(float(best_score), 4),
+            "best_score": round(best_score, 4),
             "top": top,
-            "error": None if matched else f"Below min_score={min_score}. Try lowering min_score or rephrasing.",
+            "error": None,
         }
