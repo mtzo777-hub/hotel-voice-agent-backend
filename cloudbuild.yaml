@@ -27,12 +27,12 @@ steps:
       - "--platform"
       - "managed"
       - "--allow-unauthenticated"
-      # --- keep secrets stable (ONE-LINER) ---
-      - "--set-secrets=OPENAI_API_KEY=openai-api-key:latest"
       - "--port"
       - "8080"
       - "--timeout"
       - "300"
+      # ✅ ONE-LINER: keep secret stable (always use latest version)
+      - "--update-secrets=OPENAI_API_KEY=openai-api-key:latest"
 
 images:
   - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA"
