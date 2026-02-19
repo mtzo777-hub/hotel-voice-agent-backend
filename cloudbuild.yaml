@@ -31,12 +31,10 @@ steps:
       - "8080"
       - "--timeout"
       - "300"
-      # ✅ One-liner to keep Secret Manager integration stable (no secrets in Git)
-      - "--set-secrets"
-      - "OPENAI_API_KEY=openai-api-key:latest"
-      # Recommended: tell app where faq.json is
       - "--set-env-vars"
       - "FAQ_JSON_PATH=/app/faq.json"
+      - "--set-secrets"
+      - "OPENAI_API_KEY=openai-api-key:latest"
 
 images:
   - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:$SHORT_SHA"
