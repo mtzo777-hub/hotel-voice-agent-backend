@@ -1,14 +1,21 @@
+# Dockerfile (Cloud Run)
 FROM python:3.11-slim
 
-WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-COPY requirements.txt .
+WORKDIR /app
+
+# Copy and install deps
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy everything INCLUDING faq.json into /app
-COPY . .
+# Copy app code (includes faq.json)
+COPY . /app
 
-# Bind to Cloud Run PORT (defaults to 8080)
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# Cloud Run sets PORT; default to 8080
+ENV PORT=8080
+EXPOSE 8080
+
+# IMPORTANT: Bind to 0.0.0.0 and use $PORT
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
