@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
-# Small, safe stopword list to reduce “front desk / please / available” noise.
+# IMPORTANT: do NOT include "hotel" in stopwords — it matters for intent.
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "at", "by",
     "is", "are", "be", "been", "being",
@@ -18,8 +18,7 @@ _STOPWORDS = {
     "with", "as", "from", "into", "over", "under", "up", "down",
     "please", "kindly", "may", "might", "can", "could", "should", "would",
     "subject", "depends", "available", "availability",
-    "hotel", "sunshine", "singapore",  # prevent identity words from dominating
-    "contact", "front", "desk",        # super common across many answers
+    "contact", "front", "desk",  # common in many answers -> noisy
 }
 
 
@@ -27,9 +26,25 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
+def _simple_stem(tok: str) -> str:
+    # Very small stemmer to handle smoke/smoking, checkins, etc.
+    if len(tok) > 4 and tok.endswith("ing"):
+        return tok[:-3]
+    if len(tok) > 3 and tok.endswith("ed"):
+        return tok[:-2]
+    if len(tok) > 3 and tok.endswith("s"):
+        return tok[:-1]
+    return tok
+
+
 def _tokens(text: str) -> List[str]:
     toks = _WORD_RE.findall(_norm(text))
-    return [t for t in toks if t and t not in _STOPWORDS]
+    out = []
+    for t in toks:
+        if not t or t in _STOPWORDS:
+            continue
+        out.append(_simple_stem(t))
+    return out
 
 
 def _id_to_phrase(faq_id: str) -> str:
@@ -40,30 +55,37 @@ def _id_to_phrase(faq_id: str) -> str:
     return s
 
 
-def _query_expansions(q: str) -> str:
+def _query_normalize(q: str) -> str:
     qn = _norm(q)
-    qn = qn.replace("check in", "checkin")
-    qn = qn.replace("check-out", "checkout").replace("check out", "checkout")
     qn = qn.replace("wi-fi", "wifi")
-
-    extra = []
-    # Keep expansions small and safe.
-    if "wifi" in qn or "internet" in qn:
-        extra += ["wireless", "password", "network"]
-    if "phone" in qn or "contact number" in qn:
-        extra += ["telephone", "call", "contact phone"]
-    if "email" in qn:
-        extra += ["contact email"]
-    if "late" in qn and "checkout" in qn:
-        extra += ["late check out", "checkout time", "late checkout fee"]
-    if "early" in qn and "checkin" in qn:
-        extra += ["early checkin fee", "checkin time"]
-    if "visitor" in qn or "visitors" in qn or "guest" in qn and "room" in qn:
-        extra += ["visitor policy", "registration"]
-
-    if extra:
-        qn = qn + " " + " ".join(extra)
+    qn = qn.replace("check-in", "checkin").replace("check in", "checkin")
+    qn = qn.replace("check-out", "checkout").replace("check out", "checkout")
+    qn = qn.replace("e-mail", "email")
+    # common typo from your log: "message service" -> "massage service"
+    qn = re.sub(r"\bmessage service\b", "massage service", qn)
     return qn
+
+
+# ---- INTENT ROUTER (the big fix) ----
+# Map common user phrasing -> faq.id
+_INTENT_RULES: List[Tuple[re.Pattern, str]] = [
+    # hotel identity / name
+    (re.compile(r"\b(hotel name|name of (the )?hotel|what'?s the hotel called)\b"), "hotel_identity"),
+    # phone / contact number
+    (re.compile(r"\b(contact number|phone number|contact phone|telephone|call you|contact by phone)\b"), "contact_phone"),
+    # email
+    (re.compile(r"\b(email|contact email|email address)\b"), "contact_email"),
+    # address / location / where is the hotel
+    (re.compile(r"\b(address|where is (the )?hotel|hotel location|how to get to (the )?hotel|directions)\b"), "address"),
+    # smoking
+    (re.compile(r"\b(smok|cigarette|vape)\b"), "smoking_policy"),
+    # room capacity / occupancy
+    (re.compile(r"\b(how many (people|person|persons)|max(imum)? occupancy|room capacity|how many guests)\b"), "room_capacity"),
+    # age policy
+    (re.compile(r"\b(age policy|minimum age|under 18|child policy)\b"), "age_policy"),
+    # massage service
+    (re.compile(r"\b(massage service|in-room massage|massage)\b"), "service_massage"),
+]
 
 
 @dataclass
@@ -71,7 +93,6 @@ class FAQItem:
     faq_id: str
     text: str
     phrase: str
-    doc: str   # searchable doc
     doc_tokens: List[str]
 
 
@@ -88,20 +109,19 @@ class BM25:
         for doc in tokenized_docs:
             for t in set(doc):
                 df[t] = df.get(t, 0) + 1
-        self.df = df
 
         self.idf: Dict[str, float] = {}
         for t, freq in df.items():
             self.idf[t] = math.log(1 + (self.N - freq + 0.5) / (freq + 0.5))
 
         self.tf: List[Dict[str, int]] = []
+        self.dl: List[int] = []
         for doc in tokenized_docs:
             m: Dict[str, int] = {}
             for t in doc:
                 m[t] = m.get(t, 0) + 1
             self.tf.append(m)
-
-        self.dl = [len(d) for d in tokenized_docs]
+            self.dl.append(len(doc))
 
     def score(self, query_tokens: List[str]) -> List[float]:
         if not self.N:
@@ -128,6 +148,7 @@ class FAQRetriever:
         self.faq_json_path = faq_json_path or os.getenv(
             "FAQ_JSON_PATH", "/app/faq.json")
         self.items: List[FAQItem] = []
+        self.by_id: Dict[str, FAQItem] = {}
         self._bm25: Optional[BM25] = None
         self.ready: bool = False
         self.error: Optional[str] = None
@@ -138,14 +159,13 @@ class FAQRetriever:
             if not os.path.exists(self.faq_json_path):
                 raise FileNotFoundError(
                     f"faq.json not found at {self.faq_json_path}")
-
             with open(self.faq_json_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-
             if not isinstance(raw, list):
                 raise ValueError("faq.json must be a JSON list of objects")
 
             items: List[FAQItem] = []
+            by_id: Dict[str, FAQItem] = {}
             for obj in raw:
                 if not isinstance(obj, dict):
                     continue
@@ -153,27 +173,29 @@ class FAQRetriever:
                 text = str(obj.get("text", "")).strip()
                 if not faq_id or not text:
                     continue
-
                 phrase = _id_to_phrase(faq_id)
 
-                # Keep doc = (id + phrase) heavily weighted + text.
-                # This improves matching for short queries like "contact phone".
-                doc = f"{faq_id} {phrase} {phrase} {text}"
+                # Weight ID/phrase heavily + include text
+                doc = f"{faq_id} {phrase} {phrase} {phrase} {text}"
                 doc_tokens = _tokens(doc)
 
-                items.append(FAQItem(faq_id=faq_id, text=text,
-                             phrase=phrase, doc=doc, doc_tokens=doc_tokens))
+                it = FAQItem(faq_id=faq_id, text=text,
+                             phrase=phrase, doc_tokens=doc_tokens)
+                items.append(it)
+                by_id[faq_id.lower()] = it
 
             if not items:
                 raise ValueError(
-                    "faq.json loaded but contained 0 valid FAQ items (need id and text)")
+                    "faq.json loaded but contained 0 valid FAQ items")
 
             self.items = items
+            self.by_id = by_id
             self._bm25 = BM25([it.doc_tokens for it in items])
             self.ready = True
             self.error = None
         except Exception as e:
             self.items = []
+            self.by_id = {}
             self._bm25 = None
             self.ready = False
             self.error = str(e)
@@ -181,7 +203,7 @@ class FAQRetriever:
     def status(self) -> Dict[str, Any]:
         return {
             "ready": self.ready,
-            "mode": "bm25_lexical_guarded",
+            "mode": "intent_router_plus_bm25",
             "faq_json_path": self.faq_json_path,
             "faq_count": len(self.items),
             "error": self.error,
@@ -190,36 +212,41 @@ class FAQRetriever:
     def _direct_id_match(self, query: str) -> Optional[FAQItem]:
         q = _norm(query)
         q_id_like = re.sub(r"[^a-z0-9_]+", "_", q).strip("_")
-        for it in self.items:
-            if q == it.faq_id.lower() or q_id_like == it.faq_id.lower():
-                return it
+        return self.by_id.get(q) or self.by_id.get(q_id_like)
+
+    def _intent_route(self, query: str) -> Optional[FAQItem]:
+        qn = _query_normalize(query)
+        for pat, faq_id in _INTENT_RULES:
+            if pat.search(qn):
+                return self.by_id.get(faq_id.lower())
         return None
 
-    def _overlap_score(self, q_tokens: List[str], d_tokens: List[str]) -> float:
-        # Jaccard-ish overlap (cheap rerank signal)
+    def _overlap(self, q_tokens: List[str], d_tokens: List[str]) -> float:
         qs = set(q_tokens)
         ds = set(d_tokens)
         if not qs or not ds:
             return 0.0
-        inter = len(qs & ds)
-        return inter / (len(qs) + 0.5)
+        return len(qs & ds) / (len(qs) + 0.5)
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[FAQItem, float, float]]:
-        """
-        Returns list of (item, bm25_score, blended_score).
-        blended_score used for ranking; bm25_score kept for debug.
-        """
         if not self.ready or not self._bm25:
             return []
         if not query or not query.strip():
             return []
 
+        # 1) Direct ID match
         direct = self._direct_id_match(query)
         if direct:
             return [(direct, 999.0, 999.0)]
 
-        expanded = _query_expansions(query)
-        q_tokens = _tokens(expanded)
+        # 2) Intent routing (fixes “contact number vs contact phone”, “where is the hotel”, etc.)
+        routed = self._intent_route(query)
+        if routed:
+            return [(routed, 998.0, 998.0)]
+
+        # 3) BM25 fallback
+        qn = _query_normalize(query)
+        q_tokens = _tokens(qn)
         if not q_tokens:
             return []
 
@@ -227,32 +254,26 @@ class FAQRetriever:
         if not bm25_scores:
             return []
 
-        # Candidate pool: take larger pool then rerank (stabilizes results)
-        pool_k = max(10, top_k * 5)
+        pool_k = max(12, top_k * 6)
         idxs = sorted(range(len(bm25_scores)),
                       key=lambda i: bm25_scores[i], reverse=True)[:pool_k]
 
-        # Blend BM25 with overlap; overlap prevents bizarre matches.
         scored: List[Tuple[FAQItem, float, float]] = []
         for i in idxs:
             it = self.items[i]
-            ov = self._overlap_score(q_tokens, it.doc_tokens)
-            blended = bm25_scores[i] + (2.0 * ov)  # overlap boost
+            ov = self._overlap(q_tokens, it.doc_tokens)
+            blended = bm25_scores[i] + (2.5 * ov)
             scored.append((it, float(bm25_scores[i]), float(blended)))
 
         scored.sort(key=lambda x: x[2], reverse=True)
         return scored[: max(1, top_k)]
 
-    def answer(
-        self,
-        query: str,
-        top_k: int = 5,
-        min_score: float = 0.35,
-        min_margin: float = 0.12,
-    ) -> Dict[str, Any]:
+    def answer(self, query: str, top_k: int = 5, min_score: float = 0.35) -> Dict[str, Any]:
         """
-        min_score: now applied on a normalized blended score (0..1) for consistency.
-        min_margin: reject if top1 not sufficiently better than top2 (ambiguity).
+        IMPORTANT CHANGE:
+        - Remove the “ambiguous top1 vs top2 margin reject”.
+          Your log shows correct top1 getting rejected as ambiguous. :contentReference[oaicite:2]{index=2}
+        - Use overlap + min_score gate instead.
         """
         if not self.ready:
             return {
@@ -273,25 +294,18 @@ class FAQRetriever:
                 "error": "no_results",
             }
 
-        # Convert blended scores to 0..1 for stable thresholding
         blended_scores = [r[2] for r in results]
         max_b = max(blended_scores) if blended_scores else 0.0
         norm = [(s / max_b) if max_b > 0 else 0.0 for s in blended_scores]
 
         best_item = results[0][0]
-        best_score = norm[0]
+        best_score = float(norm[0])
 
-        # Stricter for very short queries
-        q_len = len(_tokens(_query_expansions(query)))
-        short_query = q_len <= 2
-        eff_min_score = min_score + (0.15 if short_query else 0.0)
+        # Stricter threshold for super short queries
+        q_len = len(_tokens(_query_normalize(query)))
+        eff_min_score = min_score + (0.12 if q_len <= 2 else 0.0)
 
-        # Ambiguity margin check
-        margin_ok = True
-        if len(norm) >= 2:
-            margin_ok = (norm[0] - norm[1]) >= min_margin
-
-        matched = (best_score >= eff_min_score) and margin_ok
+        matched = best_score >= eff_min_score
 
         top_list = []
         for (it, bm25_s, blended_s), ns in zip(results, norm):
@@ -301,19 +315,10 @@ class FAQRetriever:
                 "score": round(float(ns), 4),
             })
 
-        err = None
-        if not matched:
-            if best_score < eff_min_score:
-                err = f"best_score {best_score:.4f} < min_score {eff_min_score:.2f}"
-            elif not margin_ok:
-                err = "ambiguous_match (top1 too close to top2)"
-            else:
-                err = "no_match"
-
         return {
             "answer": best_item.text if matched else "No match found.",
             "matched": matched,
-            "best_score": round(float(best_score), 4),
+            "best_score": round(best_score, 4),
             "top": top_list,
-            "error": err,
+            "error": None if matched else f"best_score {best_score:.4f} < min_score {eff_min_score:.2f}",
         }
