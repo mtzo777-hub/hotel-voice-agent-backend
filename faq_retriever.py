@@ -68,7 +68,6 @@ def _query_normalize(q: str) -> str:
     qn = qn.replace("e-mail", "email")
 
     # Price/fee/cost/charges normalization (keep original words too; but add a shared cue)
-    # This improves matching for "price" vs "fee".
     if re.search(r"\b(price|cost|fee|charge|charges|pricing|rate)\b", qn):
         qn = qn + " fee price cost charge rate"
 
@@ -78,50 +77,22 @@ def _query_normalize(q: str) -> str:
     return qn
 
 
-def _has_any(q: str, words: List[str]) -> bool:
-    return any(w in q for w in words)
-
-
 # ---- INTENT ROUTER (fine-tuned for your failing cases) ----
 # Map common user phrasing -> faq.id
-# NOTE: We only add/adjust rules that target your reported failures to avoid affecting other working queries.
+# NOTE: Only targeted rules to avoid affecting other working queries.
 _INTENT_RULES: List[Tuple[re.Pattern, str]] = [
-    # hotel identity / name
     (re.compile(r"\b(hotel name|name of (the )?hotel|what'?s the hotel called)\b"), "hotel_identity"),
-
-    # phone / contact number
     (re.compile(r"\b(contact number|phone number|contact phone|telephone|call you|contact by phone)\b"), "contact_phone"),
-
-    # email
     (re.compile(r"\b(email|contact email|email address)\b"), "contact_email"),
-
-    # address / location / where is the hotel
     (re.compile(r"\b(address|where is (the )?hotel|hotel location|how to get to (the )?hotel|directions)\b"), "address"),
-
-    # smoking (explicit + robust)
     (re.compile(r"\b(smoke|smoking|cigarette|vape)\b"), "smoking_policy"),
-
-    # housekeeping / cleaning (fixes housekeeping -> slippers error)
     (re.compile(r"\b(housekeeping|cleaning service|room cleaning|house keeping)\b"), "room_cleaning"),
-
-    # gym / fitness center/centre (fixes fitness centre -> allergy_notice)
     (re.compile(r"\b(gym|fitness (center|centre)|fitness room|workout|treadmill)\b"), "gym"),
-
-    # restaurant / dining at hotel (fixes restaurant -> allergy_notice)
     (re.compile(r"\b(restaurant|dining|eat at the hotel|breakfast place|where to eat)\b"),
      "restaurant_cuisine"),
-
-    # room service (fixes room service -> turn_down_service)
     (re.compile(r"\b(room service|in-room dining|order food to room)\b"), "room_service"),
-
-    # room rates / room rate(s) (fixes room rates -> meeting_rooms)
-    # We route general “room rates” questions to taxes/fees (your ground truth expectation).
     (re.compile(r"\b(room rate|room rates|rate(s)? for room|hotel rate|pricing for room)\b"), "taxes_fees"),
-
-    # massage service
     (re.compile(r"\b(massage service|in-room massage|massage)\b"), "service_massage"),
-
-    # room capacity / occupancy
     (re.compile(r"\b(how many (people|person|persons)|max(imum)? occupancy|room capacity|how many guests)\b"), "room_capacity"),
 ]
 
@@ -255,16 +226,14 @@ class FAQRetriever:
     def _intent_route(self, query: str) -> Optional[FAQItem]:
         qn = _query_normalize(query)
 
-        # Extra robustness: token-based smoke detection (prevents missing due to punctuation/wording)
+        # Extra robustness: token-based smoke detection
         qt = set(_tokens(qn))
         if "smoke" in qt or "smok" in qt or "cigarette" in qt or "vape" in qt:
             it = self.by_id.get("smoking_policy")
             if it:
                 return it
 
-        # Fee vs policy disambiguation for early check-in / late checkout:
-        # If query asks "how much/price/fee/cost/charges" we prefer *_fee;
-        # otherwise prefer *_policy.
+        # Fee vs policy disambiguation for early check-in / late checkout
         fee_words = ["how much", "price", "fee",
                      "cost", "charge", "charges", "pricing"]
         wants_fee = any(w in qn for w in fee_words)
@@ -281,7 +250,6 @@ class FAQRetriever:
             if it:
                 return it
 
-        # Apply regex rules
         for pat, faq_id in _INTENT_RULES:
             if pat.search(qn):
                 it = self.by_id.get(faq_id.lower())
@@ -307,7 +275,7 @@ class FAQRetriever:
         if direct:
             return [(direct, 999.0, 999.0)]
 
-        # 2) Intent routing (targeted fine-tuning)
+        # 2) Intent routing
         routed = self._intent_route(query)
         if routed:
             return [(routed, 998.0, 998.0)]
@@ -344,6 +312,9 @@ class FAQRetriever:
                 "best_score": 0.0,
                 "top": [],
                 "error": self.error or "not_ready",
+                "best_id": None,
+                "route": "not_ready",
+                "eff_min_score": None,
             }
 
         results = self.search(query, top_k=top_k)
@@ -354,7 +325,19 @@ class FAQRetriever:
                 "best_score": 0.0,
                 "top": [],
                 "error": "no_results",
+                "best_id": None,
+                "route": "no_results",
+                "eff_min_score": None,
             }
+
+        # Determine route based on sentinel values used in search()
+        top_bm25 = float(results[0][1])
+        if top_bm25 >= 999.0:
+            route = "direct_id"
+        elif top_bm25 >= 998.0:
+            route = "intent"
+        else:
+            route = "bm25"
 
         blended_scores = [r[2] for r in results]
         max_b = max(blended_scores) if blended_scores else 0.0
@@ -365,7 +348,7 @@ class FAQRetriever:
 
         # Stricter threshold for super short queries
         q_len = len(_tokens(_query_normalize(query)))
-        eff_min_score = min_score + (0.12 if q_len <= 2 else 0.0)
+        eff_min_score = float(min_score + (0.12 if q_len <= 2 else 0.0))
 
         matched = best_score >= eff_min_score
 
@@ -383,4 +366,9 @@ class FAQRetriever:
             "best_score": round(best_score, 4),
             "top": top_list,
             "error": None if matched else f"best_score {best_score:.4f} < min_score {eff_min_score:.2f}",
+            # Extra metadata for observability (main.py logs it)
+            "best_id": best_item.faq_id,
+            "best_question": best_item.phrase or best_item.faq_id,
+            "route": route,
+            "eff_min_score": round(float(eff_min_score), 4),
         }
