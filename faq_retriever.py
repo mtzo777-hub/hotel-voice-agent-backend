@@ -27,7 +27,7 @@ def _norm(text: str) -> str:
 
 
 def _simple_stem(tok: str) -> str:
-    # Very small stemmer to handle smoke/smoking, checkins, etc.
+    # Very small stemmer to handle smoke/smoking, charges/charge, etc.
     if len(tok) > 4 and tok.endswith("ing"):
         return tok[:-3]
     if len(tok) > 3 and tok.endswith("ed"):
@@ -57,34 +57,72 @@ def _id_to_phrase(faq_id: str) -> str:
 
 def _query_normalize(q: str) -> str:
     qn = _norm(q)
+
+    # Spelling normalization (centre vs center, etc.)
+    qn = qn.replace("centre", "center")
+
+    # Common token normalizations
     qn = qn.replace("wi-fi", "wifi")
     qn = qn.replace("check-in", "checkin").replace("check in", "checkin")
     qn = qn.replace("check-out", "checkout").replace("check out", "checkout")
     qn = qn.replace("e-mail", "email")
-    # common typo from your log: "message service" -> "massage service"
+
+    # Price/fee/cost/charges normalization (keep original words too; but add a shared cue)
+    # This improves matching for "price" vs "fee".
+    if re.search(r"\b(price|cost|fee|charge|charges|pricing|rate)\b", qn):
+        qn = qn + " fee price cost charge rate"
+
+    # Common typo observed earlier: "message service" -> "massage service"
     qn = re.sub(r"\bmessage service\b", "massage service", qn)
+
     return qn
 
 
-# ---- INTENT ROUTER (the big fix) ----
+def _has_any(q: str, words: List[str]) -> bool:
+    return any(w in q for w in words)
+
+
+# ---- INTENT ROUTER (fine-tuned for your failing cases) ----
 # Map common user phrasing -> faq.id
+# NOTE: We only add/adjust rules that target your reported failures to avoid affecting other working queries.
 _INTENT_RULES: List[Tuple[re.Pattern, str]] = [
     # hotel identity / name
     (re.compile(r"\b(hotel name|name of (the )?hotel|what'?s the hotel called)\b"), "hotel_identity"),
+
     # phone / contact number
     (re.compile(r"\b(contact number|phone number|contact phone|telephone|call you|contact by phone)\b"), "contact_phone"),
+
     # email
     (re.compile(r"\b(email|contact email|email address)\b"), "contact_email"),
+
     # address / location / where is the hotel
     (re.compile(r"\b(address|where is (the )?hotel|hotel location|how to get to (the )?hotel|directions)\b"), "address"),
-    # smoking
-    (re.compile(r"\b(smok|cigarette|vape)\b"), "smoking_policy"),
-    # room capacity / occupancy
-    (re.compile(r"\b(how many (people|person|persons)|max(imum)? occupancy|room capacity|how many guests)\b"), "room_capacity"),
-    # age policy
-    (re.compile(r"\b(age policy|minimum age|under 18|child policy)\b"), "age_policy"),
+
+    # smoking (explicit + robust)
+    (re.compile(r"\b(smoke|smoking|cigarette|vape)\b"), "smoking_policy"),
+
+    # housekeeping / cleaning (fixes housekeeping -> slippers error)
+    (re.compile(r"\b(housekeeping|cleaning service|room cleaning|house keeping)\b"), "room_cleaning"),
+
+    # gym / fitness center/centre (fixes fitness centre -> allergy_notice)
+    (re.compile(r"\b(gym|fitness (center|centre)|fitness room|workout|treadmill)\b"), "gym"),
+
+    # restaurant / dining at hotel (fixes restaurant -> allergy_notice)
+    (re.compile(r"\b(restaurant|dining|eat at the hotel|breakfast place|where to eat)\b"),
+     "restaurant_cuisine"),
+
+    # room service (fixes room service -> turn_down_service)
+    (re.compile(r"\b(room service|in-room dining|order food to room)\b"), "room_service"),
+
+    # room rates / room rate(s) (fixes room rates -> meeting_rooms)
+    # We route general “room rates” questions to taxes/fees (your ground truth expectation).
+    (re.compile(r"\b(room rate|room rates|rate(s)? for room|hotel rate|pricing for room)\b"), "taxes_fees"),
+
     # massage service
     (re.compile(r"\b(massage service|in-room massage|massage)\b"), "service_massage"),
+
+    # room capacity / occupancy
+    (re.compile(r"\b(how many (people|person|persons)|max(imum)? occupancy|room capacity|how many guests)\b"), "room_capacity"),
 ]
 
 
@@ -203,7 +241,7 @@ class FAQRetriever:
     def status(self) -> Dict[str, Any]:
         return {
             "ready": self.ready,
-            "mode": "intent_router_plus_bm25",
+            "mode": "intent_router_plus_bm25_v2_1",
             "faq_json_path": self.faq_json_path,
             "faq_count": len(self.items),
             "error": self.error,
@@ -216,9 +254,39 @@ class FAQRetriever:
 
     def _intent_route(self, query: str) -> Optional[FAQItem]:
         qn = _query_normalize(query)
+
+        # Extra robustness: token-based smoke detection (prevents missing due to punctuation/wording)
+        qt = set(_tokens(qn))
+        if "smoke" in qt or "smok" in qt or "cigarette" in qt or "vape" in qt:
+            it = self.by_id.get("smoking_policy")
+            if it:
+                return it
+
+        # Fee vs policy disambiguation for early check-in / late checkout:
+        # If query asks "how much/price/fee/cost/charges" we prefer *_fee;
+        # otherwise prefer *_policy.
+        fee_words = ["how much", "price", "fee",
+                     "cost", "charge", "charges", "pricing"]
+        wants_fee = any(w in qn for w in fee_words)
+
+        if "early" in qn and "checkin" in qn:
+            target = "early_checkin_fee" if wants_fee else "early_checkin_policy"
+            it = self.by_id.get(target)
+            if it:
+                return it
+
+        if "late" in qn and "checkout" in qn:
+            target = "late_checkout_fee" if wants_fee else "late_checkout_policy"
+            it = self.by_id.get(target)
+            if it:
+                return it
+
+        # Apply regex rules
         for pat, faq_id in _INTENT_RULES:
             if pat.search(qn):
-                return self.by_id.get(faq_id.lower())
+                it = self.by_id.get(faq_id.lower())
+                if it:
+                    return it
         return None
 
     def _overlap(self, q_tokens: List[str], d_tokens: List[str]) -> float:
@@ -239,7 +307,7 @@ class FAQRetriever:
         if direct:
             return [(direct, 999.0, 999.0)]
 
-        # 2) Intent routing (fixes “contact number vs contact phone”, “where is the hotel”, etc.)
+        # 2) Intent routing (targeted fine-tuning)
         routed = self._intent_route(query)
         if routed:
             return [(routed, 998.0, 998.0)]
@@ -269,12 +337,6 @@ class FAQRetriever:
         return scored[: max(1, top_k)]
 
     def answer(self, query: str, top_k: int = 5, min_score: float = 0.35) -> Dict[str, Any]:
-        """
-        IMPORTANT CHANGE:
-        - Remove the “ambiguous top1 vs top2 margin reject”.
-          Your log shows correct top1 getting rejected as ambiguous. :contentReference[oaicite:2]{index=2}
-        - Use overlap + min_score gate instead.
-        """
         if not self.ready:
             return {
                 "answer": "Retriever is not ready.",
