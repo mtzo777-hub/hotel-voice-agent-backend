@@ -1,17 +1,3 @@
-"""
-faq_retriever.py
-
-Goal:
-- Work with ONLY faq.json (no rag_store, no embeddings, no external deps).
-- Robust lexical retrieval (BM25 + a few safe heuristics).
-- Deterministic and easy to maintain: update faq.json and redeploy.
-
-faq.json expected format: a JSON list like:
-[
-  {"id": "checkin_time", "text": "Check-in is from 3 PM..."},
-  ...
-]
-"""
 from __future__ import annotations
 
 import json
@@ -21,8 +7,20 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-
 _WORD_RE = re.compile(r"[a-z0-9]+")
+
+# Small, safe stopword list to reduce “front desk / please / available” noise.
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "at", "by",
+    "is", "are", "be", "been", "being",
+    "it", "this", "that", "these", "those",
+    "you", "your", "we", "our",
+    "with", "as", "from", "into", "over", "under", "up", "down",
+    "please", "kindly", "may", "might", "can", "could", "should", "would",
+    "subject", "depends", "available", "availability",
+    "hotel", "sunshine", "singapore",  # prevent identity words from dominating
+    "contact", "front", "desk",        # super common across many answers
+}
 
 
 def _norm(text: str) -> str:
@@ -30,11 +28,11 @@ def _norm(text: str) -> str:
 
 
 def _tokens(text: str) -> List[str]:
-    return _WORD_RE.findall(_norm(text))
+    toks = _WORD_RE.findall(_norm(text))
+    return [t for t in toks if t and t not in _STOPWORDS]
 
 
 def _id_to_phrase(faq_id: str) -> str:
-    # "checkin_time" -> "checkin time"
     s = (faq_id or "").strip().lower()
     s = re.sub(r"[^a-z0-9_]+", " ", s)
     s = s.replace("_", " ")
@@ -43,37 +41,25 @@ def _id_to_phrase(faq_id: str) -> str:
 
 
 def _query_expansions(q: str) -> str:
-    """
-    Expand common paraphrases without changing meaning.
-    Keep it small and safe (avoid surprising matches).
-    """
     qn = _norm(q)
-
-    # canonicalize common variants
     qn = qn.replace("check in", "checkin")
     qn = qn.replace("check-out", "checkout").replace("check out", "checkout")
     qn = qn.replace("wi-fi", "wifi")
 
-    # light synonyms (add, don't replace)
     extra = []
-    if "address" in qn or ("where" in qn and "hotel" in qn):
-        extra += ["location", "located", "directions", "map"]
+    # Keep expansions small and safe.
     if "wifi" in qn or "internet" in qn:
-        extra += ["wireless", "network", "password"]
-    if "breakfast" in qn:
-        extra += ["buffet"]
-    if "parking" in qn:
-        extra += ["car park"]
-    if "pool" in qn:
-        extra += ["swimming"]
-    if "gym" in qn or "fitness" in qn:
-        extra += ["workout"]
-    if "laundry" in qn:
-        extra += ["washing", "dry cleaning", "drycleaning"]
-    if "room types" in qn or ("room" in qn and "types" in qn):
-        extra += ["available rooms", "categories"]
+        extra += ["wireless", "password", "network"]
+    if "phone" in qn or "contact number" in qn:
+        extra += ["telephone", "call", "contact phone"]
+    if "email" in qn:
+        extra += ["contact email"]
     if "late" in qn and "checkout" in qn:
-        extra += ["late check out", "checkout time"]
+        extra += ["late check out", "checkout time", "late checkout fee"]
+    if "early" in qn and "checkin" in qn:
+        extra += ["early checkin fee", "checkin time"]
+    if "visitor" in qn or "visitors" in qn or "guest" in qn and "room" in qn:
+        extra += ["visitor policy", "registration"]
 
     if extra:
         qn = qn + " " + " ".join(extra)
@@ -85,15 +71,11 @@ class FAQItem:
     faq_id: str
     text: str
     phrase: str
-    doc: str  # searchable document text
+    doc: str   # searchable doc
+    doc_tokens: List[str]
 
 
 class BM25:
-    """
-    Minimal BM25 implementation (Okapi BM25).
-    No third-party dependency.
-    """
-
     def __init__(self, tokenized_docs: List[List[str]], k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
         self.b = b
@@ -102,19 +84,16 @@ class BM25:
         self.avgdl = (sum(len(d)
                       for d in tokenized_docs) / self.N) if self.N else 0.0
 
-        # document frequencies
         df: Dict[str, int] = {}
         for doc in tokenized_docs:
             for t in set(doc):
                 df[t] = df.get(t, 0) + 1
         self.df = df
 
-        # idf
         self.idf: Dict[str, float] = {}
         for t, freq in df.items():
             self.idf[t] = math.log(1 + (self.N - freq + 0.5) / (freq + 0.5))
 
-        # term frequencies per doc
         self.tf: List[Dict[str, int]] = []
         for doc in tokenized_docs:
             m: Dict[str, int] = {}
@@ -176,18 +155,21 @@ class FAQRetriever:
                     continue
 
                 phrase = _id_to_phrase(faq_id)
-                # searchable doc = id + id phrase + answer text
-                doc = f"{faq_id} {phrase} {text}"
-                items.append(
-                    FAQItem(faq_id=faq_id, text=text, phrase=phrase, doc=doc))
+
+                # Keep doc = (id + phrase) heavily weighted + text.
+                # This improves matching for short queries like "contact phone".
+                doc = f"{faq_id} {phrase} {phrase} {text}"
+                doc_tokens = _tokens(doc)
+
+                items.append(FAQItem(faq_id=faq_id, text=text,
+                             phrase=phrase, doc=doc, doc_tokens=doc_tokens))
 
             if not items:
                 raise ValueError(
                     "faq.json loaded but contained 0 valid FAQ items (need id and text)")
 
             self.items = items
-            tokenized_docs = [_tokens(it.doc) for it in items]
-            self._bm25 = BM25(tokenized_docs)
+            self._bm25 = BM25([it.doc_tokens for it in items])
             self.ready = True
             self.error = None
         except Exception as e:
@@ -199,7 +181,7 @@ class FAQRetriever:
     def status(self) -> Dict[str, Any]:
         return {
             "ready": self.ready,
-            "mode": "bm25_lexical",
+            "mode": "bm25_lexical_guarded",
             "faq_json_path": self.faq_json_path,
             "faq_count": len(self.items),
             "error": self.error,
@@ -213,7 +195,20 @@ class FAQRetriever:
                 return it
         return None
 
-    def search(self, query: str, top_k: int = 5) -> List[Tuple[FAQItem, float]]:
+    def _overlap_score(self, q_tokens: List[str], d_tokens: List[str]) -> float:
+        # Jaccard-ish overlap (cheap rerank signal)
+        qs = set(q_tokens)
+        ds = set(d_tokens)
+        if not qs or not ds:
+            return 0.0
+        inter = len(qs & ds)
+        return inter / (len(qs) + 0.5)
+
+    def search(self, query: str, top_k: int = 5) -> List[Tuple[FAQItem, float, float]]:
+        """
+        Returns list of (item, bm25_score, blended_score).
+        blended_score used for ranking; bm25_score kept for debug.
+        """
         if not self.ready or not self._bm25:
             return []
         if not query or not query.strip():
@@ -221,25 +216,44 @@ class FAQRetriever:
 
         direct = self._direct_id_match(query)
         if direct:
-            return [(direct, 1.0)]
+            return [(direct, 999.0, 999.0)]
 
         expanded = _query_expansions(query)
         q_tokens = _tokens(expanded)
         if not q_tokens:
             return []
 
-        scores = self._bm25.score(q_tokens)
-        if not scores:
+        bm25_scores = self._bm25.score(q_tokens)
+        if not bm25_scores:
             return []
 
-        max_s = max(scores) if scores else 0.0
-        norm_scores = [(s / max_s) if max_s > 0 else 0.0 for s in scores]
+        # Candidate pool: take larger pool then rerank (stabilizes results)
+        pool_k = max(10, top_k * 5)
+        idxs = sorted(range(len(bm25_scores)),
+                      key=lambda i: bm25_scores[i], reverse=True)[:pool_k]
 
-        idxs = sorted(range(len(norm_scores)),
-                      key=lambda i: norm_scores[i], reverse=True)[: max(1, top_k)]
-        return [(self.items[i], float(norm_scores[i])) for i in idxs]
+        # Blend BM25 with overlap; overlap prevents bizarre matches.
+        scored: List[Tuple[FAQItem, float, float]] = []
+        for i in idxs:
+            it = self.items[i]
+            ov = self._overlap_score(q_tokens, it.doc_tokens)
+            blended = bm25_scores[i] + (2.0 * ov)  # overlap boost
+            scored.append((it, float(bm25_scores[i]), float(blended)))
 
-    def answer(self, query: str, top_k: int = 5, min_score: float = 0.35) -> Dict[str, Any]:
+        scored.sort(key=lambda x: x[2], reverse=True)
+        return scored[: max(1, top_k)]
+
+    def answer(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_score: float = 0.35,
+        min_margin: float = 0.12,
+    ) -> Dict[str, Any]:
+        """
+        min_score: now applied on a normalized blended score (0..1) for consistency.
+        min_margin: reject if top1 not sufficiently better than top2 (ambiguity).
+        """
         if not self.ready:
             return {
                 "answer": "Retriever is not ready.",
@@ -259,20 +273,47 @@ class FAQRetriever:
                 "error": "no_results",
             }
 
-        best_item, best_score = results[0]
-        matched = best_score >= float(min_score)
+        # Convert blended scores to 0..1 for stable thresholding
+        blended_scores = [r[2] for r in results]
+        max_b = max(blended_scores) if blended_scores else 0.0
+        norm = [(s / max_b) if max_b > 0 else 0.0 for s in blended_scores]
+
+        best_item = results[0][0]
+        best_score = norm[0]
+
+        # Stricter for very short queries
+        q_len = len(_tokens(_query_expansions(query)))
+        short_query = q_len <= 2
+        eff_min_score = min_score + (0.15 if short_query else 0.0)
+
+        # Ambiguity margin check
+        margin_ok = True
+        if len(norm) >= 2:
+            margin_ok = (norm[0] - norm[1]) >= min_margin
+
+        matched = (best_score >= eff_min_score) and margin_ok
 
         top_list = []
-        for it, s in results:
-            top_list.append(
-                {"id": it.faq_id, "question": it.phrase or it.faq_id,
-                    "score": round(float(s), 4)}
-            )
+        for (it, bm25_s, blended_s), ns in zip(results, norm):
+            top_list.append({
+                "id": it.faq_id,
+                "question": it.phrase or it.faq_id,
+                "score": round(float(ns), 4),
+            })
+
+        err = None
+        if not matched:
+            if best_score < eff_min_score:
+                err = f"best_score {best_score:.4f} < min_score {eff_min_score:.2f}"
+            elif not margin_ok:
+                err = "ambiguous_match (top1 too close to top2)"
+            else:
+                err = "no_match"
 
         return {
             "answer": best_item.text if matched else "No match found.",
             "matched": matched,
             "best_score": round(float(best_score), 4),
             "top": top_list,
-            "error": None if matched else f"best_score {best_score:.4f} < min_score {min_score:.2f}",
+            "error": err,
         }
