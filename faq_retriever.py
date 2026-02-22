@@ -1,300 +1,317 @@
-"""
-faq_retriever.py
-Lexical FAQ retriever with safer "not-found" behavior.
-
-Key changes vs earlier version:
-- Removed "normalize by max(score)" which made best_score ~ 1.0 for almost any query.
-- Introduced confidence score based on:
-  (a) BM25 raw score magnitude,
-  (b) token overlap ratio (coverage),
-  (c) distinctiveness vs the 2nd-best candidate.
-- Returns matched=False when confidence < min_score (safe fallback contract).
-"""
-
-from __future__ import annotations
-
 import json
+import math
 import os
 import re
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-
-from rank_bm25 import BM25Okapi
+from typing import Any, Dict, List, Optional
 
 
-# --- Tokenization / normalization ------------------------------------------------
-
-_WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-
-# A small, pragmatic stopword list (kept local to avoid heavy deps).
-# Add conversational fillers to reduce false positives for "ok", "hmm", etc.
-_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "could", "did", "do", "does",
-    "for", "from", "had", "has", "have", "how", "i", "in", "is", "it", "its", "may",
-    "me", "my", "of", "on", "or", "our", "please", "should", "so", "that", "the", "their",
-    "them", "then", "there", "these", "they", "this", "to", "us", "was", "we", "were",
-    "what", "when", "where", "which", "who", "will", "with", "would", "you", "your",
-
-    # fillers / short acknowledgements (often cause accidental matches)
-    "ok", "okay", "hmm", "um", "uh", "yeah", "yep", "nope", "alright", "right",
-
-    # courtesy / endings (frontend should handle, but keep backend safe too)
-    "thanks", "thank", "bye", "goodbye",
-}
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-def tokenize(text: str) -> List[str]:
+def _tokenize(text: str) -> List[str]:
+    # Basic lexical tokenizer (fast, dependency-free)
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    return [t for t in text.split() if t]
+
+
+def _char_ngrams(text: str, n: int = 3) -> List[str]:
+    # Character ngrams improve tolerance to minor typos/spacing
+    text = re.sub(r"\s+", " ", (text or "").lower()).strip()
     if not text:
         return []
-    toks = [t.lower() for t in _WORD_RE.findall(text)]
-    toks = [t for t in toks if t not in _STOPWORDS and len(t) >= 2]
-    return toks
+    if len(text) < n:
+        return [text]
+    return [text[i: i + n] for i in range(0, len(text) - n + 1)]
 
 
-# --- Data model -----------------------------------------------------------------
+def _jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / float(len(sa | sb))
 
-@dataclass(frozen=True)
-class FaqEntry:
+
+class BM25OkapiLite:
+    """
+    Lightweight BM25 implementation (no external dependency).
+    Good enough for small corpora like FAQ (~150 entries).
+    """
+
+    def __init__(self, corpus_tokens: List[List[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.corpus_tokens = corpus_tokens
+
+        self.N = len(corpus_tokens)
+        self.doc_lens = [len(d) for d in corpus_tokens]
+        self.avgdl = (sum(self.doc_lens) / self.N) if self.N else 0.0
+
+        # Document frequency per term
+        df: Dict[str, int] = {}
+        for doc in corpus_tokens:
+            for term in set(doc):
+                df[term] = df.get(term, 0) + 1
+        self.df = df
+
+        # Smoothed IDF
+        self.idf: Dict[str, float] = {}
+        for term, freq in df.items():
+            self.idf[term] = math.log(
+                1.0 + (self.N - freq + 0.5) / (freq + 0.5))
+
+        # Sparse TF per doc
+        self.tfs: List[Dict[str, int]] = []
+        for doc in corpus_tokens:
+            tf: Dict[str, int] = {}
+            for t in doc:
+                tf[t] = tf.get(t, 0) + 1
+            self.tfs.append(tf)
+
+    def get_scores(self, query_tokens: List[str]) -> List[float]:
+        if not self.N:
+            return []
+        scores = [0.0] * self.N
+        for i in range(self.N):
+            dl = self.doc_lens[i] or 1
+            denom_norm = self.k1 * \
+                (1 - self.b + self.b * (dl / (self.avgdl or 1.0)))
+            tf = self.tfs[i]
+            s = 0.0
+            for t in query_tokens:
+                if t not in tf:
+                    continue
+                f = tf[t]
+                idf = self.idf.get(t, 0.0)
+                s += idf * (f * (self.k1 + 1.0)) / (f + denom_norm)
+            scores[i] = s
+        return scores
+
+
+@dataclass
+class RetrievalCandidate:
     id: str
     question: str
     answer: str
-    aliases: Tuple[str, ...]
+    score_raw: float
+    score_conf: float
 
 
-# --- Retriever ------------------------------------------------------------------
+@dataclass
+class RetrievalResult:
+    query: str
+    matched: bool
+    answer: str
+    best_score: float
+    best_id: str
+    route: str
+    candidates: List[RetrievalCandidate]
+    latency_ms: int
+    reason: Optional[str] = None
 
-class FaqRetriever:
+
+class FAQRetriever:
     """
-    Loads faq.json and provides BM25 + overlap-based retrieval.
+    Hybrid lexical retriever:
+    - BM25 raw scoring
+    - Char trigram Jaccard (typos/spaces)
+    Produces confidence score in [0..1] used for matched decision.
     """
 
-    def __init__(self, faq_path: str):
-        self.faq_path = faq_path
-        self.entries: List[FaqEntry] = []
-        self._docs_tokens: List[List[str]] = []
-        self._docs_token_sets: List[set] = []
-        self._bm25: Optional[BM25Okapi] = None
+    DEFAULT_FAQ_PATHS = [
+        "faq.json",
+        "/app/faq.json",
+        "/app/data/faq.json",
+        "/workspace/faq.json",
+    ]
 
-        self._load()
+    # Inputs that should NEVER match an FAQ (avoid random matches)
+    FILLER_QUERIES = {
+        "ok",
+        "okay",
+        "hmm",
+        "erm",
+        "uh",
+        "um",
+        "hello",
+        "hi",
+        "hey",
+        "thanks",
+        "thank you",
+        "thankyou",
+        "bye",
+        "goodbye",
+    }
 
-    def _load(self) -> None:
-        if not os.path.exists(self.faq_path):
-            raise FileNotFoundError(f"faq.json not found at: {self.faq_path}")
+    def __init__(self, faq_path: Optional[str] = None):
+        self.faq_path = faq_path or os.getenv(
+            "FAQ_PATH") or self._find_faq_path()
+        self.faq = self._load_faq(self.faq_path)
 
-        with open(self.faq_path, "r", encoding="utf-8") as f:
+        self._docs: List[Dict[str, str]] = []
+        corpus_tokens: List[List[str]] = []
+
+        for item in self.faq:
+            q = (item.get("question") or "").strip()
+            a = (item.get("text") or item.get("answer") or "").strip()
+            if not q or not a:
+                continue
+            doc_text = f"{q} {item.get('id', '')}"
+            toks = _tokenize(doc_text)
+            self._docs.append(
+                {"id": item.get("id", ""), "question": q, "answer": a, "doc_text": doc_text})
+            corpus_tokens.append(toks)
+
+        self.bm25 = BM25OkapiLite(corpus_tokens) if corpus_tokens else None
+
+    def _find_faq_path(self) -> str:
+        for p in self.DEFAULT_FAQ_PATHS:
+            if os.path.exists(p):
+                return p
+        raise FileNotFoundError(
+            "faq.json not found. Set FAQ_PATH env var or include faq.json in the container.")
+
+    def _load_faq(self, path: str) -> List[Dict[str, Any]]:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # support either {"faqs":[...]} or direct list
-        items = data.get("faqs", data)
-        if not isinstance(items, list):
-            raise ValueError(
-                "faq.json must be a list or have key 'faqs' as a list")
+        if isinstance(data, dict) and "faq" in data and isinstance(data["faq"], list):
+            return data["faq"]
+        if isinstance(data, list):
+            return data
+        raise ValueError(
+            "Unsupported FAQ JSON format. Expected a list or {faq:[...]}.")
 
-        entries: List[FaqEntry] = []
-        docs_tokens: List[List[str]] = []
-        docs_sets: List[set] = []
+    def _confidence(self, query: str, doc_text: str, bm25_raw: float) -> float:
+        # Normalize BM25 raw score into [0..1] with saturation
+        bm25_norm = bm25_raw / (bm25_raw + 5.0) if bm25_raw > 0 else 0.0
 
-        for obj in items:
-            if not isinstance(obj, dict):
-                continue
+        # Char trigram similarity
+        char_sim = _jaccard(_char_ngrams(query, 3), _char_ngrams(doc_text, 3))
 
-            faq_id = str(obj.get("id", "")).strip() or str(
-                obj.get("key", "")).strip()
-            question = str(obj.get("question", "")).strip()
-            answer = str(obj.get("answer", "")).strip()
+        # Token overlap ratio (guard against random matches)
+        q_toks = _tokenize(query)
+        d_toks = _tokenize(doc_text)
+        tok_overlap = (len(set(q_toks) & set(d_toks)) /
+                       float(len(set(q_toks)) or 1.0)) if q_toks else 0.0
 
-            # Some earlier datasets used "text" as the answer field
-            if not answer and obj.get("text"):
-                answer = str(obj.get("text", "")).strip()
+        blended = 0.55 * bm25_norm + 0.30 * char_sim + 0.15 * tok_overlap
+        return float(max(0.0, min(1.0, blended)))
 
-            aliases_raw = obj.get("aliases") or obj.get("alias") or []
-            if isinstance(aliases_raw, str):
-                aliases_raw = [aliases_raw]
-            aliases = tuple(str(a).strip()
-                            for a in aliases_raw if str(a).strip())
+    def answer(self, query: str, top_k: int = 5, min_score: float = 0.35) -> RetrievalResult:
+        t0 = _now_ms()
+        query = (query or "").strip()
 
-            # Skip unusable rows
-            if not faq_id or (not question and not answer):
-                continue
+        if not query:
+            return RetrievalResult(
+                query=query,
+                matched=False,
+                answer="Sorry, I didn’t catch that. Please ask a hotel question.",
+                best_score=0.0,
+                best_id="",
+                route="guardrail_empty",
+                candidates=[],
+                latency_ms=_now_ms() - t0,
+                reason="empty_query",
+            )
 
-            if not question:
-                # If only answer exists, use id as question label so it is still retrievable
-                question = faq_id.replace("_", " ").strip()
+        q_norm = re.sub(r"\s+", " ", query.lower()).strip()
+        if q_norm in self.FILLER_QUERIES or len(q_norm) <= 2:
+            return RetrievalResult(
+                query=query,
+                matched=False,
+                answer="Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
+                best_score=0.0,
+                best_id="",
+                route="guardrail_filler_or_short",
+                candidates=[],
+                latency_ms=_now_ms() - t0,
+                reason="filler_or_short",
+            )
 
-            entries.append(FaqEntry(id=faq_id, question=question,
-                           answer=answer, aliases=aliases))
+        if not self.bm25 or not self._docs:
+            return RetrievalResult(
+                query=query,
+                matched=False,
+                answer="Sorry, the FAQ knowledge base is currently unavailable.",
+                best_score=0.0,
+                best_id="",
+                route="degraded_no_index",
+                candidates=[],
+                latency_ms=_now_ms() - t0,
+                reason="no_index",
+            )
 
-            # Retrieval text: question + id + aliases (NOT answer) to reduce false matches.
-            retrieval_text = " ".join(
-                [faq_id.replace("_", " "), question, *aliases])
-            toks = tokenize(retrieval_text)
-            docs_tokens.append(toks)
-            docs_sets.append(set(toks))
-
-        if not entries:
-            raise ValueError("No valid FAQ entries found in faq.json")
-
-        self.entries = entries
-        self._docs_tokens = docs_tokens
-        self._docs_token_sets = docs_sets
-        self._bm25 = BM25Okapi(docs_tokens)
-
-    # ---- scoring ---------------------------------------------------------------
-
-    @staticmethod
-    def _bounded(raw: float, k: float = 3.0) -> float:
-        """Map a positive raw score to (0,1) with diminishing returns."""
-        if raw <= 0:
-            return 0.0
-        return raw / (raw + k)
-
-    @staticmethod
-    def _distinctiveness(best_raw: float, second_raw: float) -> float:
-        """How clearly best beats second best (0..1)."""
-        if best_raw <= 0:
-            return 0.0
-        d = (best_raw - second_raw) / (best_raw + 1e-9)
-        if d < 0:
-            d = 0.0
-        if d > 1:
-            d = 1.0
-        return d
-
-    def _confidence(
-        self,
-        query_tokens: List[str],
-        best_idx: int,
-        best_raw: float,
-        second_raw: float,
-    ) -> Tuple[float, float]:
-        """
-        Return (confidence_0to1, overlap_ratio).
-        """
-        if not query_tokens:
-            return 0.0, 0.0
-
-        qset = set(query_tokens)
-        dset = self._docs_token_sets[best_idx]
-
-        # coverage of query tokens
-        overlap = len(qset & dset) / max(len(qset), 1)
-        base = self._bounded(best_raw, k=3.0)
-        distinct = self._distinctiveness(best_raw, second_raw)
-
-        # Combine (empirically stable):
-        # - overlap gates confidence strongly
-        # - base captures BM25 strength
-        # - distinct penalizes ambiguous matches
-        conf = overlap * base * (0.6 + 0.4 * distinct)
-
-        # Extra penalty: very low overlap should not pass even with moderate BM25.
-        if overlap < 0.34:
-            conf *= 0.4
-
-        return conf, overlap
-
-    # ---- public API ------------------------------------------------------------
-
-    def answer(
-        self,
-        query: str,
-        *,
-        top_k: int = 5,
-        min_score: float = 0.35,
-    ) -> Dict[str, Any]:
-        """
-        Returns a response dict:
-        {
-          matched: bool,
-          answer: str,
-          best_id: str,
-          best_score: float,   # 0..1 confidence
-          best_raw: float,     # BM25 raw score
-          overlap: float,      # 0..1
-          top: [ {id, score, raw, overlap, question}, ... ]   # limited debug info
-        }
-        """
-        if self._bm25 is None:
-            raise RuntimeError("Retriever not initialized")
-
-        q = (query or "").strip()
-        q_tokens = tokenize(q)
-
+        q_tokens = _tokenize(query)
         if not q_tokens:
-            return {
-                "matched": False,
-                "answer": "Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
-                "best_id": None,
-                "best_score": 0.0,
-                "best_raw": 0.0,
-                "overlap": 0.0,
-                "top": [],
-                "error": "empty_or_stopword_query",
-            }
+            return RetrievalResult(
+                query=query,
+                matched=False,
+                answer="Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
+                best_score=0.0,
+                best_id="",
+                route="guardrail_no_tokens",
+                candidates=[],
+                latency_ms=_now_ms() - t0,
+                reason="no_tokens",
+            )
 
-        raw_scores = self._bm25.get_scores(
-            q_tokens)  # list[float], length = docs
-        if not raw_scores:
-            return {
-                "matched": False,
-                "answer": "Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
-                "best_id": None,
-                "best_score": 0.0,
-                "best_raw": 0.0,
-                "overlap": 0.0,
-                "top": [],
-                "error": "no_scores",
-            }
+        raw_scores = self.bm25.get_scores(q_tokens)
+        ranked = sorted(range(len(raw_scores)),
+                        key=lambda i: raw_scores[i], reverse=True)
+        top_idx = ranked[: max(1, min(int(top_k or 5), 20))]
 
-        # top-k indices by raw score
-        k = max(1, min(int(top_k), len(raw_scores)))
-        top_idx = sorted(range(len(raw_scores)),
-                         key=lambda i: raw_scores[i], reverse=True)[:k]
-
-        best_idx = top_idx[0]
-        best_raw = float(raw_scores[best_idx])
-        second_raw = float(raw_scores[top_idx[1]]) if len(top_idx) > 1 else 0.0
-
-        best_score, best_overlap = self._confidence(
-            q_tokens, best_idx, best_raw, second_raw)
-
-        # Build debug top list with per-candidate overlap/confidence
-        top_list: List[Dict[str, Any]] = []
+        candidates: List[RetrievalCandidate] = []
         for i in top_idx:
-            raw_i = float(raw_scores[i])
-            score_i, ov_i = self._confidence(
-                q_tokens, i, raw_i, best_raw if i != best_idx else second_raw)
-            ent = self.entries[i]
-            top_list.append({
-                "id": ent.id,
-                "question": ent.question,
-                "raw": round(raw_i, 6),
-                "overlap": round(ov_i, 4),
-                "score": round(score_i, 6),
-            })
+            doc = self._docs[i]
+            raw = float(raw_scores[i])
+            conf = self._confidence(query, doc["doc_text"], raw)
+            candidates.append(
+                RetrievalCandidate(
+                    id=doc["id"],
+                    question=doc["question"],
+                    answer=doc["answer"],
+                    score_raw=raw,
+                    score_conf=conf,
+                )
+            )
 
-        ent_best = self.entries[best_idx]
+        candidates_sorted = sorted(candidates, key=lambda c: (
+            c.score_conf, c.score_raw), reverse=True)
+        best = candidates_sorted[0] if candidates_sorted else None
 
-        if best_score < float(min_score):
-            return {
-                "matched": False,
-                "answer": "Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
-                "best_id": ent_best.id,
-                "best_score": round(best_score, 6),
-                "best_raw": round(best_raw, 6),
-                "overlap": round(best_overlap, 4),
-                "top": top_list,
-                "error": "below_min_score",
-            }
+        best_conf = float(best.score_conf) if best else 0.0
+        best_raw = float(best.score_raw) if best else 0.0
+        second_conf = float(candidates_sorted[1].score_conf) if len(
+            candidates_sorted) > 1 else 0.0
+        margin = best_conf - second_conf
 
-        # Matched
-        return {
-            "matched": True,
-            "answer": ent_best.answer or "Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
-            "best_id": ent_best.id,
-            "best_score": round(best_score, 6),
-            "best_raw": round(best_raw, 6),
-            "overlap": round(best_overlap, 4),
-            "top": top_list,
-            "error": None,
-        }
+        # Match decision:
+        # - must be above min_score
+        # - must have a margin, unless confidence is clearly high
+        matched = (best_conf >= float(min_score)) and (
+            margin >= 0.05 or best_conf >= (float(min_score) + 0.10))
+
+        if matched and best:
+            answer = best.answer
+            route = "bm25_hybrid_match"
+            best_id = best.id
+        else:
+            answer = "Sorry, I don’t have that information yet. Please contact the hotel reception for assistance."
+            route = "safe_fallback"
+            best_id = best.id if best else ""
+
+        return RetrievalResult(
+            query=query,
+            matched=bool(matched),
+            answer=answer,
+            best_score=best_conf,
+            best_id=best_id,
+            route=route,
+            candidates=candidates_sorted,
+            latency_ms=_now_ms() - t0,
+            reason=None if matched else f"below_threshold_or_low_margin (conf={best_conf:.3f}, raw={best_raw:.3f}, margin={margin:.3f})",
+        )
