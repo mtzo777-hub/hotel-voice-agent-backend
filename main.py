@@ -1,3 +1,17 @@
+"""
+Hotel Voice Agent Backend (FastAPI on Cloud Run)
+
+Endpoints:
+- GET /           : simple banner (kept for Swagger "Root")
+- GET /health     : service + retriever readiness
+- POST /faq/answer: lexical retrieval over faq.json with not-found contract
+
+Logging:
+- JSON-ish structured logs with request_id for Cloud Logging correlation
+"""
+
+from __future__ import annotations
+
 import json
 import os
 import time
@@ -6,182 +20,210 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-from faq_retriever import FAQRetriever
+from faq_retriever import FAQRetriever, RetrievalResult
+
 
 APP_NAME = "hotel_voice_agent"
-APP_VERSION = os.getenv("APP_VERSION", "2026.02.22")
-DEFAULT_MIN_SCORE = float(os.getenv("DEFAULT_MIN_SCORE", "0.35"))
-DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "5"))
 
-app = FastAPI(title="Hotel Voice Agent Backend", version=APP_VERSION)
+# --- FastAPI app ---
+app = FastAPI(
+    title="Hotel Voice Agent Backend",
+    version=os.getenv("APP_VERSION", "2026.02.22"),
+    description="FastAPI backend for the Sunshine Hotel Voice Agent (BM25 lexical retrieval over faq.json).",
+)
 
-# Allow frontend hosted on GitHub Pages, plus local dev
+# CORS: allow GitHub Pages + local dev (safe default: allow all; tighten later if needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:5500",
-        "http://127.0.0.1:5500",
-        "https://mtzo777-hub.github.io",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Global retriever (initialized at startup)
 retriever: Optional[FAQRetriever] = None
-retriever_error: Optional[str] = None
 
 
-def log_json(payload: Dict[str, Any]) -> None:
-    # Cloud Run captures stdout; JSON logs are easy to filter in Cloud Logging.
-    print(json.dumps(payload, ensure_ascii=False))
+# --- Request / Response models (ensures Swagger shows query/top_k/min_score) ---
+class FAQAnswerRequest(BaseModel):
+    query: str = Field(..., examples=["When is check-in time?"])
+    top_k: int = Field(5, ge=1, le=20, examples=[5])
+    min_score: float = Field(0.35, ge=0.0, le=10.0, examples=[0.35])
+
+
+class FAQTopItem(BaseModel):
+    id: str
+    question: str
+    score: float
+
+
+class FAQAnswerResponse(BaseModel):
+    request_id: str
+    matched: bool
+    answer: str
+    best_score: float
+    best_id: str
+    route: str
+    latency_ms: int
+    top: list[FAQTopItem] = []
+
+
+def log_event(event: Dict[str, Any]) -> None:
+    """
+    Print structured logs. Cloud Run captures stdout to Cloud Logging.
+    Keep it one-line JSON for easy filtering.
+    """
+    try:
+        print(json.dumps(event, ensure_ascii=False))
+    except Exception:
+        # Fallback: never crash due to logging
+        print(str(event))
 
 
 @app.on_event("startup")
-def _startup() -> None:
-    global retriever, retriever_error
+def startup() -> None:
+    global retriever
+    # expect faq.json in repo root (same folder as main.py)
+    faq_path = os.getenv("FAQ_PATH", "faq.json")
     try:
-        retriever = FAQRetriever()
-        retriever_error = None
-        log_json(
+        retriever = FAQRetriever(faq_path=faq_path)
+        log_event(
             {
                 "app": APP_NAME,
-                "event": "startup_ok",
-                "version": APP_VERSION,
-                "faq_path": getattr(retriever, "faq_path", None),
-                "faq_count": len(getattr(retriever, "faq", []) or []),
+                "event": "startup",
+                "status": "ok",
+                "faq_path": faq_path,
+                "faq_count": retriever.faq_count,
             }
         )
     except Exception as e:
         retriever = None
-        retriever_error = repr(e)
-        log_json(
+        log_event(
             {
                 "app": APP_NAME,
-                "event": "startup_degraded",
-                "version": APP_VERSION,
-                "error": retriever_error,
+                "event": "startup",
+                "status": "error",
+                "faq_path": faq_path,
+                "error": repr(e),
             }
         )
 
 
+@app.get("/")
+def root() -> Dict[str, str]:
+    # Keep this so Swagger shows GET / Root (your “old version”)
+    return {"service": "hotel-voice-agent-backend", "status": "ok"}
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    # Always return 200 so Cloud Run keeps serving even if retriever is degraded.
+    global retriever
     if retriever is None:
-        return {"status": "degraded", "retriever": "unavailable", "error": retriever_error, "version": APP_VERSION}
+        return {"status": "degraded", "retriever": "unavailable", "error": "retriever_not_initialized"}
+
+    if not retriever.is_ready:
+        return {"status": "degraded", "retriever": "unavailable", "error": retriever.last_error or "unknown"}
+
     return {
         "status": "ok",
         "retriever": "ok",
-        "faq_count": len(getattr(retriever, "faq", []) or []),
-        "version": APP_VERSION,
+        "faq_count": retriever.faq_count,
+        "version": app.version,
     }
 
 
-@app.post("/faq/answer")
-async def faq_answer(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+@app.post("/faq/answer", response_model=FAQAnswerResponse)
+async def faq_answer(payload: FAQAnswerRequest, request: Request) -> FAQAnswerResponse:
     """
-    Request JSON:
-      {
-        "query": "When is check-in time?",
-        "top_k": 5,
-        "min_score": 0.35
-      }
-
-    Response JSON:
-      {
-        "request_id": "...",
-        "matched": true/false,
-        "answer": "...",
-        "best_score": 0.0-1.0,
-        "best_id": "...",
-        "route": "...",
-        "latency_ms": 12
-      }
+    Not-found contract:
+    - If retrieval confidence is low, return matched=false with a safe fallback answer.
+    - Never hallucinate.
     """
-    req_id = str(uuid.uuid4())
-    t0 = time.time()
+    global retriever
 
-    query = (payload.get("query") or "").strip()
-    top_k = int(payload.get("top_k") or DEFAULT_TOP_K)
-    min_score = float(payload.get("min_score") or DEFAULT_MIN_SCORE)
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    t0 = time.perf_counter()
 
-    client_ip = request.headers.get(
-        "x-forwarded-for") or (request.client.host if request.client else None)
+    client_ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
-    log_json(
+    log_event(
         {
             "app": APP_NAME,
             "event": "faq_answer_request",
-            "request_id": req_id,
-            "query": query,
-            "query_len": len(query),
-            "top_k": top_k,
-            "min_score": min_score,
+            "request_id": request_id,
+            "query": payload.query,
+            "query_len": len(payload.query or ""),
+            "top_k": payload.top_k,
+            "min_score": payload.min_score,
             "client_ip": client_ip,
             "user_agent": user_agent,
         }
     )
 
-    if retriever is None:
-        resp = {
-            "request_id": req_id,
-            "matched": False,
-            "answer": "Sorry, the FAQ knowledge base is currently unavailable.",
-            "best_score": 0.0,
-            "best_id": "",
-            "route": "degraded_no_retriever",
-            "latency_ms": int((time.time() - t0) * 1000),
-            "error": retriever_error,
-        }
-        log_json({"app": APP_NAME, "event": "faq_answer_response",
-                 "request_id": req_id, **resp})
-        return resp
-
-    try:
-        result = retriever.answer(
-            query=query, top_k=top_k, min_score=min_score)
-
-        resp = {
-            "request_id": req_id,
-            "matched": bool(result.matched),
-            "answer": result.answer,
-            "best_score": float(result.best_score),
-            "best_id": result.best_id,
-            "route": result.route,
-            "latency_ms": int((time.time() - t0) * 1000),
-        }
-
-        log_json(
+    # If retriever is not ready, do NOT attempt retrieval; return safe degraded response
+    if retriever is None or not retriever.is_ready:
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        resp = FAQAnswerResponse(
+            request_id=request_id,
+            matched=False,
+            answer="Sorry, the FAQ knowledge base is currently unavailable.",
+            best_score=0.0,
+            best_id="",
+            route="degraded_no_index",
+            latency_ms=latency_ms,
+            top=[],
+        )
+        log_event(
             {
                 "app": APP_NAME,
                 "event": "faq_answer_response",
-                "request_id": req_id,
-                "matched": resp["matched"],
-                "best_score": resp["best_score"],
-                "best_id": resp["best_id"],
-                "route": resp["route"],
-                "latency_ms": resp["latency_ms"],
-                "reason": getattr(result, "reason", None),
+                "request_id": request_id,
+                "matched": resp.matched,
+                "best_score": resp.best_score,
+                "best_id": resp.best_id,
+                "route": resp.route,
+                "latency_ms": resp.latency_ms,
+                "error": getattr(retriever, "last_error", None),
             }
         )
         return resp
 
-    except Exception as e:
-        resp = {
-            "request_id": req_id,
-            "matched": False,
-            "answer": "Sorry, the service encountered an internal error.",
-            "best_score": 0.0,
-            "best_id": "",
-            "route": "error",
-            "latency_ms": int((time.time() - t0) * 1000),
-            "error": repr(e),
+    # Normal retrieval
+    result: RetrievalResult = retriever.answer(
+        query=payload.query,
+        top_k=payload.top_k,
+        min_score=payload.min_score,
+    )
+
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+
+    resp = FAQAnswerResponse(
+        request_id=request_id,
+        matched=result.matched,
+        answer=result.answer,
+        best_score=result.best_score,
+        best_id=result.best_id,
+        route=result.route,
+        latency_ms=latency_ms,
+        top=[FAQTopItem(id=t["id"], question=t["question"],
+                        score=float(t["score"])) for t in result.top],
+    )
+
+    log_event(
+        {
+            "app": APP_NAME,
+            "event": "faq_answer_response",
+            "request_id": request_id,
+            "matched": resp.matched,
+            "best_score": resp.best_score,
+            "best_id": resp.best_id,
+            "route": resp.route,
+            "latency_ms": resp.latency_ms,
         }
-        log_json({"app": APP_NAME, "event": "faq_answer_error",
-                 "request_id": req_id, "error": repr(e)})
-        return resp
+    )
+
+    return resp

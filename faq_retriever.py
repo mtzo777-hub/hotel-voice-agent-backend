@@ -1,317 +1,286 @@
+"""
+FAQ Retriever (BM25 lexical scoring) with stronger Not-Found guardrails.
+
+Goal:
+- Never return random wrong answers for nonsense queries.
+- matched=false unless there is enough lexical evidence.
+"""
+
+from __future__ import annotations
+
 import json
 import math
-import os
 import re
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from difflib import SequenceMatcher
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+SAFE_FALLBACK = "Sorry, I don’t have that information yet. Please contact the hotel reception for assistance."
 
 
-def _tokenize(text: str) -> List[str]:
-    # Basic lexical tokenizer (fast, dependency-free)
-    text = (text or "").lower()
-    text = re.sub(r"[^a-z0-9\s]+", " ", text)
-    return [t for t in text.split() if t]
+def _normalize_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    # normalize hyphens and spaces
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def _char_ngrams(text: str, n: int = 3) -> List[str]:
-    # Character ngrams improve tolerance to minor typos/spacing
-    text = re.sub(r"\s+", " ", (text or "").lower()).strip()
-    if not text:
-        return []
-    if len(text) < n:
-        return [text]
-    return [text[i: i + n] for i in range(0, len(text) - n + 1)]
-
-
-def _jaccard(a: List[str], b: List[str]) -> float:
-    sa, sb = set(a), set(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / float(len(sa | sb))
-
-
-class BM25OkapiLite:
+def _tokenize(s: str) -> List[str]:
     """
-    Lightweight BM25 implementation (no external dependency).
-    Good enough for small corpora like FAQ (~150 entries).
+    Conservative tokenizer:
+    - Keeps alphanumerics and hyphen words
+    - Drops very short tokens that often cause noise (except 'pm', 'am')
     """
-
-    def __init__(self, corpus_tokens: List[List[str]], k1: float = 1.5, b: float = 0.75):
-        self.k1 = k1
-        self.b = b
-        self.corpus_tokens = corpus_tokens
-
-        self.N = len(corpus_tokens)
-        self.doc_lens = [len(d) for d in corpus_tokens]
-        self.avgdl = (sum(self.doc_lens) / self.N) if self.N else 0.0
-
-        # Document frequency per term
-        df: Dict[str, int] = {}
-        for doc in corpus_tokens:
-            for term in set(doc):
-                df[term] = df.get(term, 0) + 1
-        self.df = df
-
-        # Smoothed IDF
-        self.idf: Dict[str, float] = {}
-        for term, freq in df.items():
-            self.idf[term] = math.log(
-                1.0 + (self.N - freq + 0.5) / (freq + 0.5))
-
-        # Sparse TF per doc
-        self.tfs: List[Dict[str, int]] = []
-        for doc in corpus_tokens:
-            tf: Dict[str, int] = {}
-            for t in doc:
-                tf[t] = tf.get(t, 0) + 1
-            self.tfs.append(tf)
-
-    def get_scores(self, query_tokens: List[str]) -> List[float]:
-        if not self.N:
-            return []
-        scores = [0.0] * self.N
-        for i in range(self.N):
-            dl = self.doc_lens[i] or 1
-            denom_norm = self.k1 * \
-                (1 - self.b + self.b * (dl / (self.avgdl or 1.0)))
-            tf = self.tfs[i]
-            s = 0.0
-            for t in query_tokens:
-                if t not in tf:
-                    continue
-                f = tf[t]
-                idf = self.idf.get(t, 0.0)
-                s += idf * (f * (self.k1 + 1.0)) / (f + denom_norm)
-            scores[i] = s
-        return scores
+    s = _normalize_text(s)
+    tokens = re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", s)
+    cleaned = []
+    for t in tokens:
+        if t in ("am", "pm"):
+            cleaned.append(t)
+            continue
+        if len(t) <= 1:
+            continue
+        cleaned.append(t)
+    return cleaned
 
 
-@dataclass
-class RetrievalCandidate:
-    id: str
-    question: str
-    answer: str
-    score_raw: float
-    score_conf: float
+def _is_gibberish(query: str) -> bool:
+    """
+    Detect obvious nonsense:
+    - very short and no meaningful tokens
+    - mostly non-alphanumeric
+    - single token with low vowel ratio and long random letters
+    """
+    q = (query or "").strip()
+    if not q:
+        return True
+
+    tokens = _tokenize(q)
+    if len(tokens) == 0:
+        return True
+
+    # single very short token like "ok", "hmm"
+    if len(tokens) == 1 and len(tokens[0]) <= 3:
+        return True
+
+    # If the query is one long token and looks random
+    if len(tokens) == 1 and len(tokens[0]) >= 5:
+        t = tokens[0]
+        vowels = sum(1 for c in t if c in "aeiou")
+        # very low vowel ratio often indicates random string: "afggg", "asdfghjkl"
+        if vowels / max(len(t), 1) < 0.2:
+            return True
+
+    return False
 
 
 @dataclass
 class RetrievalResult:
-    query: str
     matched: bool
     answer: str
-    best_score: float
     best_id: str
+    best_score: float
     route: str
-    candidates: List[RetrievalCandidate]
-    latency_ms: int
-    reason: Optional[str] = None
+    top: List[Dict[str, Any]]
 
 
 class FAQRetriever:
-    """
-    Hybrid lexical retriever:
-    - BM25 raw scoring
-    - Char trigram Jaccard (typos/spaces)
-    Produces confidence score in [0..1] used for matched decision.
-    """
+    def __init__(self, faq_path: str = "faq.json") -> None:
+        self.faq_path = faq_path
+        self.is_ready: bool = False
+        self.last_error: Optional[str] = None
 
-    DEFAULT_FAQ_PATHS = [
-        "faq.json",
-        "/app/faq.json",
-        "/app/data/faq.json",
-        "/workspace/faq.json",
-    ]
+        self.entries: List[Dict[str, Any]] = []
+        self.questions: List[str] = []
+        self.answers: List[str] = []
+        self.ids: List[str] = []
 
-    # Inputs that should NEVER match an FAQ (avoid random matches)
-    FILLER_QUERIES = {
-        "ok",
-        "okay",
-        "hmm",
-        "erm",
-        "uh",
-        "um",
-        "hello",
-        "hi",
-        "hey",
-        "thanks",
-        "thank you",
-        "thankyou",
-        "bye",
-        "goodbye",
-    }
+        # BM25 statistics
+        self.doc_tokens: List[List[str]] = []
+        self.df: Dict[str, int] = {}
+        self.idf: Dict[str, float] = {}
+        self.avgdl: float = 0.0
+        self.doc_len: List[int] = []
 
-    def __init__(self, faq_path: Optional[str] = None):
-        self.faq_path = faq_path or os.getenv(
-            "FAQ_PATH") or self._find_faq_path()
-        self.faq = self._load_faq(self.faq_path)
+        # parameters
+        self.k1 = 1.5
+        self.b = 0.75
 
-        self._docs: List[Dict[str, str]] = []
-        corpus_tokens: List[List[str]] = []
+        self._load_and_build()
 
-        for item in self.faq:
-            q = (item.get("question") or "").strip()
-            a = (item.get("text") or item.get("answer") or "").strip()
-            if not q or not a:
+    @property
+    def faq_count(self) -> int:
+        return len(self.entries)
+
+    def _load_and_build(self) -> None:
+        try:
+            p = Path(self.faq_path)
+            if not p.exists():
+                # try relative to current file
+                p2 = Path(__file__).parent / self.faq_path
+                if p2.exists():
+                    p = p2
+
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                raise ValueError("faq.json must be a list of entries")
+
+            self.entries = raw
+            self.ids = [str(x.get("id", "")).strip() for x in raw]
+            self.questions = [str(x.get("question", "")).strip() for x in raw]
+            self.answers = [str(x.get("answer", "")).strip() for x in raw]
+
+            # Build BM25 index over questions (and optionally ids)
+            self.doc_tokens = []
+            for q, _id in zip(self.questions, self.ids):
+                # index both question and id to help short keyword queries
+                doc = f"{q} {_id}".strip()
+                toks = _tokenize(doc)
+                self.doc_tokens.append(toks)
+
+            self.doc_len = [len(toks) for toks in self.doc_tokens]
+            self.avgdl = sum(self.doc_len) / max(len(self.doc_len), 1)
+
+            # DF
+            self.df = {}
+            for toks in self.doc_tokens:
+                for t in set(toks):
+                    self.df[t] = self.df.get(t, 0) + 1
+
+            # IDF (BM25)
+            N = len(self.doc_tokens)
+            self.idf = {}
+            for t, df in self.df.items():
+                # classic BM25 idf
+                self.idf[t] = math.log(1 + (N - df + 0.5) / (df + 0.5))
+
+            self.is_ready = True
+            self.last_error = None
+        except Exception as e:
+            self.is_ready = False
+            self.last_error = repr(e)
+
+    def _bm25_scores(self, query_tokens: List[str]) -> List[float]:
+        if not query_tokens:
+            return [0.0 for _ in self.doc_tokens]
+
+        scores: List[float] = []
+        for toks, dl in zip(self.doc_tokens, self.doc_len):
+            if dl == 0:
+                scores.append(0.0)
                 continue
-            doc_text = f"{q} {item.get('id', '')}"
-            toks = _tokenize(doc_text)
-            self._docs.append(
-                {"id": item.get("id", ""), "question": q, "answer": a, "doc_text": doc_text})
-            corpus_tokens.append(toks)
 
-        self.bm25 = BM25OkapiLite(corpus_tokens) if corpus_tokens else None
+            tf: Dict[str, int] = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
 
-    def _find_faq_path(self) -> str:
-        for p in self.DEFAULT_FAQ_PATHS:
-            if os.path.exists(p):
-                return p
-        raise FileNotFoundError(
-            "faq.json not found. Set FAQ_PATH env var or include faq.json in the container.")
+            score = 0.0
+            for q in query_tokens:
+                if q not in tf:
+                    continue
+                idf = self.idf.get(q, 0.0)
+                freq = tf[q]
+                denom = freq + self.k1 * \
+                    (1 - self.b + self.b * (dl / max(self.avgdl, 1e-9)))
+                score += idf * (freq * (self.k1 + 1)) / max(denom, 1e-9)
 
-    def _load_faq(self, path: str) -> List[Dict[str, Any]]:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            scores.append(float(score))
+        return scores
 
-        if isinstance(data, dict) and "faq" in data and isinstance(data["faq"], list):
-            return data["faq"]
-        if isinstance(data, list):
-            return data
-        raise ValueError(
-            "Unsupported FAQ JSON format. Expected a list or {faq:[...]}.")
-
-    def _confidence(self, query: str, doc_text: str, bm25_raw: float) -> float:
-        # Normalize BM25 raw score into [0..1] with saturation
-        bm25_norm = bm25_raw / (bm25_raw + 5.0) if bm25_raw > 0 else 0.0
-
-        # Char trigram similarity
-        char_sim = _jaccard(_char_ngrams(query, 3), _char_ngrams(doc_text, 3))
-
-        # Token overlap ratio (guard against random matches)
-        q_toks = _tokenize(query)
-        d_toks = _tokenize(doc_text)
-        tok_overlap = (len(set(q_toks) & set(d_toks)) /
-                       float(len(set(q_toks)) or 1.0)) if q_toks else 0.0
-
-        blended = 0.55 * bm25_norm + 0.30 * char_sim + 0.15 * tok_overlap
-        return float(max(0.0, min(1.0, blended)))
+    def _secondary_similarity(self, query: str, candidate_question: str) -> float:
+        """
+        Secondary guardrail: character similarity between query and the candidate question.
+        Helps prevent random strings from matching due to tokenization artifacts.
+        """
+        qn = _normalize_text(query)
+        cn = _normalize_text(candidate_question)
+        if not qn or not cn:
+            return 0.0
+        return float(SequenceMatcher(None, qn, cn).ratio())
 
     def answer(self, query: str, top_k: int = 5, min_score: float = 0.35) -> RetrievalResult:
-        t0 = _now_ms()
-        query = (query or "").strip()
-
-        if not query:
+        # Basic readiness
+        if not self.is_ready:
             return RetrievalResult(
-                query=query,
-                matched=False,
-                answer="Sorry, I didn’t catch that. Please ask a hotel question.",
-                best_score=0.0,
-                best_id="",
-                route="guardrail_empty",
-                candidates=[],
-                latency_ms=_now_ms() - t0,
-                reason="empty_query",
-            )
-
-        q_norm = re.sub(r"\s+", " ", query.lower()).strip()
-        if q_norm in self.FILLER_QUERIES or len(q_norm) <= 2:
-            return RetrievalResult(
-                query=query,
-                matched=False,
-                answer="Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
-                best_score=0.0,
-                best_id="",
-                route="guardrail_filler_or_short",
-                candidates=[],
-                latency_ms=_now_ms() - t0,
-                reason="filler_or_short",
-            )
-
-        if not self.bm25 or not self._docs:
-            return RetrievalResult(
-                query=query,
                 matched=False,
                 answer="Sorry, the FAQ knowledge base is currently unavailable.",
-                best_score=0.0,
                 best_id="",
+                best_score=0.0,
                 route="degraded_no_index",
-                candidates=[],
-                latency_ms=_now_ms() - t0,
-                reason="no_index",
+                top=[],
+            )
+
+        # Strong not-found gate for obvious nonsense
+        if _is_gibberish(query):
+            return RetrievalResult(
+                matched=False,
+                answer=SAFE_FALLBACK,
+                best_id="",
+                best_score=0.0,
+                route="guardrail_gibberish",
+                top=[],
             )
 
         q_tokens = _tokenize(query)
         if not q_tokens:
             return RetrievalResult(
-                query=query,
                 matched=False,
-                answer="Sorry, I don’t have that information yet. Please contact the hotel reception for assistance.",
-                best_score=0.0,
+                answer=SAFE_FALLBACK,
                 best_id="",
-                route="guardrail_no_tokens",
-                candidates=[],
-                latency_ms=_now_ms() - t0,
-                reason="no_tokens",
+                best_score=0.0,
+                route="guardrail_empty",
+                top=[],
             )
 
-        raw_scores = self.bm25.get_scores(q_tokens)
-        ranked = sorted(range(len(raw_scores)),
-                        key=lambda i: raw_scores[i], reverse=True)
-        top_idx = ranked[: max(1, min(int(top_k or 5), 20))]
+        scores = self._bm25_scores(q_tokens)
 
-        candidates: List[RetrievalCandidate] = []
-        for i in top_idx:
-            doc = self._docs[i]
-            raw = float(raw_scores[i])
-            conf = self._confidence(query, doc["doc_text"], raw)
-            candidates.append(
-                RetrievalCandidate(
-                    id=doc["id"],
-                    question=doc["question"],
-                    answer=doc["answer"],
-                    score_raw=raw,
-                    score_conf=conf,
-                )
+        # Take top_k candidates
+        indexed = list(enumerate(scores))
+        indexed.sort(key=lambda x: x[1], reverse=True)
+        top_idx = indexed[: max(1, min(top_k, 20))]
+
+        # Build top list
+        top_list: List[Dict[str, Any]] = []
+        for i, sc in top_idx:
+            top_list.append(
+                {"id": self.ids[i], "question": self.questions[i], "score": float(sc)})
+
+        best_i, best_score = top_idx[0]
+        best_id = self.ids[best_i]
+        best_q = self.questions[best_i]
+        best_a = self.answers[best_i] if self.answers[best_i] else SAFE_FALLBACK
+
+        # Secondary similarity guardrail (prevents random strings matching)
+        sim = self._secondary_similarity(query, best_q)
+
+        # Token overlap guardrail
+        best_tokens = set(_tokenize(best_q))
+        overlap = len(set(q_tokens) & best_tokens) / max(len(set(q_tokens)), 1)
+
+        # Decision:
+        # Must pass BM25 threshold + overlap OR similarity.
+        passed = (best_score >= float(min_score)) and (
+            overlap >= 0.5 or sim >= 0.42)
+
+        if not passed:
+            return RetrievalResult(
+                matched=False,
+                answer=SAFE_FALLBACK,
+                best_id=best_id,
+                best_score=float(best_score),
+                route="not_found",
+                top=top_list,
             )
-
-        candidates_sorted = sorted(candidates, key=lambda c: (
-            c.score_conf, c.score_raw), reverse=True)
-        best = candidates_sorted[0] if candidates_sorted else None
-
-        best_conf = float(best.score_conf) if best else 0.0
-        best_raw = float(best.score_raw) if best else 0.0
-        second_conf = float(candidates_sorted[1].score_conf) if len(
-            candidates_sorted) > 1 else 0.0
-        margin = best_conf - second_conf
-
-        # Match decision:
-        # - must be above min_score
-        # - must have a margin, unless confidence is clearly high
-        matched = (best_conf >= float(min_score)) and (
-            margin >= 0.05 or best_conf >= (float(min_score) + 0.10))
-
-        if matched and best:
-            answer = best.answer
-            route = "bm25_hybrid_match"
-            best_id = best.id
-        else:
-            answer = "Sorry, I don’t have that information yet. Please contact the hotel reception for assistance."
-            route = "safe_fallback"
-            best_id = best.id if best else ""
 
         return RetrievalResult(
-            query=query,
-            matched=bool(matched),
-            answer=answer,
-            best_score=best_conf,
+            matched=True,
+            answer=best_a,
             best_id=best_id,
-            route=route,
-            candidates=candidates_sorted,
-            latency_ms=_now_ms() - t0,
-            reason=None if matched else f"below_threshold_or_low_margin (conf={best_conf:.3f}, raw={best_raw:.3f}, margin={margin:.3f})",
+            best_score=float(best_score),
+            route="bm25",
+            top=top_list,
         )
