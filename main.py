@@ -1,10 +1,17 @@
+# main.py
 """
-main.py
+Sunshine Hotel Voice Agent Backend (FastAPI on Cloud Run)
 
-FastAPI backend for Sunshine Hotel Voice Agent (FAQ retrieval).
-Designed for Cloud Run deployment with structured logs (Cloud Logging).
+Endpoints:
+- GET  /        : simple root for sanity check
+- GET  /health  : health + retriever status
+- POST /faq/answer : FAQ retrieval (BM25 + lightweight synonym/alias expansion)
+
+Design notes:
+- Stateless backend; FAQ KB is bundled in the container as faq.json and loaded at startup.
+- Request/response contract is stable for both Swagger (/docs) and GitHub Pages frontend.
+- Structured logs include a request_id to correlate Cloud Run logs.
 """
-
 from __future__ import annotations
 
 import json
@@ -13,60 +20,50 @@ import time
 import uuid
 from typing import Any, Dict
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from faq_retriever import FAQRetriever
 
+
 APP_VERSION = os.getenv("APP_VERSION", "2026.02.23")
+FAQ_PATH = os.getenv("FAQ_PATH", "faq.json")
 
 app = FastAPI(
     title="Hotel Voice Agent Backend",
     version=APP_VERSION,
-    description="BM25 FAQ retrieval backend for Sunshine Hotel Voice Agent.",
+    description="FastAPI backend for Sunshine Hotel Voice Agent (BM25 FAQ retrieval).",
 )
 
-# CORS: allow GitHub Pages frontend and local dev. (Safe here because no auth / no secrets.)
+# CORS: GitHub Pages frontend + Swagger testing
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=["*"],  # for exam/demo; lock down in production
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-FAQ_PATH = os.getenv("FAQ_PATH", "faq.json")
+# Load retriever once on startup
 retriever = FAQRetriever(FAQ_PATH)
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _request_id(req: Request) -> str:
-    rid = req.headers.get(
-        "x-request-id") or req.headers.get("x-cloud-trace-context")
-    if rid:
-        return rid.split("/")[0]
-    return str(uuid.uuid4())
-
-
-def _log(event: str, payload: Dict[str, Any]) -> None:
-    # Cloud Run captures stdout/stderr into Cloud Logging.
-    record = {"event": event, **payload}
-    print(json.dumps(record, ensure_ascii=False))
-
-
 class FAQRequest(BaseModel):
-    query: str = Field(..., examples=["When is check-in time?"])
-    top_k: int = Field(5, ge=1, le=10, examples=[5])
-    min_score: float = Field(0.35, ge=0.0, le=1.0, examples=[0.35])
+    query: str = Field(...,
+                       description="User query text (from STT or typed input).")
+    top_k: int = Field(
+        5, ge=1, le=20, description="Number of top candidates to return.")
+    min_score: float = Field(0.35, ge=0.0, le=1.0,
+                             description="Match threshold (0..1).")
 
     class Config:
-        # This restores the Swagger "Edit Value" defaults nicely.
         json_schema_extra = {
-            "example": {"query": "When is check-in time?", "top_k": 5, "min_score": 0.35}
+            "examples": [
+                {"query": "When is check-in time?", "top_k": 5, "min_score": 0.35},
+                {"query": "What is the name of the hotel?",
+                    "top_k": 5, "min_score": 0.35},
+            ]
         }
 
 
@@ -80,56 +77,74 @@ class FAQResponse(BaseModel):
     latency_ms: int
     top: list
 
+    class Config:
+        json_schema_extra = {
+            "examples": [
+                {
+                    "request_id": "uuid",
+                    "matched": True,
+                    "answer": "At Sunshine Hotel Singapore, check-in starts at 2:00 PM.",
+                    "best_score": 1.0,
+                    "best_id": "checkin_time",
+                    "route": "bm25",
+                    "latency_ms": 12,
+                    "top": [
+                        {"id": "checkin_time", "question": "checkin_time", "score": 1.0},
+                        {"id": "early_checkin_policy",
+                            "question": "early_checkin_policy", "score": 0.62},
+                    ],
+                }
+            ]
+        }
+
+
+def _log(event: str, payload: Dict[str, Any]) -> None:
+    # Cloud Run ingests stdout; JSON lines are easiest to filter in Logs Explorer.
+    obj = {"event": event, **payload}
+    print(json.dumps(obj, ensure_ascii=False))
+
 
 @app.get("/")
-def root() -> Dict[str, Any]:
-    # Restore GET / Root (you said you prefer the old Swagger layout)
-    return {
-        "service": "hotel-voice-agent-backend",
-        "version": APP_VERSION,
-        "endpoints": ["/health", "/faq/answer"],
-    }
+def root() -> Dict[str, str]:
+    return {"service": "hotel-voice-agent-backend", "version": APP_VERSION}
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    if retriever.is_ready:
-        return {"status": "ok", "retriever": "ok", "faq_count": retriever.faq_count, "version": APP_VERSION}
-    return {"status": "degraded", "retriever": "unavailable", "error": "retriever_not_ready", "version": APP_VERSION}
+    return {
+        "status": "ok" if retriever.is_ready else "degraded",
+        "retriever": "ok" if retriever.is_ready else "unavailable",
+        "faq_count": retriever.faq_count,
+        "version": APP_VERSION,
+        "error": retriever.error,
+    }
 
 
 @app.post("/faq/answer", response_model=FAQResponse)
-async def faq_answer(req: Request, body: FAQRequest) -> Dict[str, Any]:
-    rid = _request_id(req)
+def faq_answer(req: FAQRequest) -> Dict[str, Any]:
+    rid = str(uuid.uuid4())
+    t0 = time.time()
 
-    t0 = _now_ms()
-    _log(
-        "faq_answer_request",
-        {
-            "request_id": rid,
-            "query": body.query,
-            "query_len": len(body.query or ""),
-            "top_k": body.top_k,
-            "min_score": body.min_score,
-            "client_ip": req.client.host if req.client else None,
-            "user_agent": req.headers.get("user-agent"),
-        },
-    )
+    _log("faq_answer_request", {
+        "request_id": rid,
+        "query": req.query,
+        "query_len": len(req.query or ""),
+        "top_k": req.top_k,
+        "min_score": req.min_score,
+    })
 
     result = retriever.answer(
-        body.query, top_k=body.top_k, min_score=body.min_score, request_id=rid)
-    result["latency_ms"] = _now_ms() - t0  # end-to-end time
+        req.query, top_k=req.top_k, min_score=req.min_score, request_id=rid)
+    # overwrite latency based on server wall-clock (keeps consistent)
+    result["latency_ms"] = int((time.time() - t0) * 1000)
 
-    _log(
-        "faq_answer_response",
-        {
-            "request_id": rid,
-            "matched": result.get("matched"),
-            "best_score": result.get("best_score"),
-            "best_id": result.get("best_id"),
-            "route": result.get("route"),
-            "latency_ms": result.get("latency_ms"),
-        },
-    )
+    _log("faq_answer_response", {
+        "request_id": rid,
+        "matched": result.get("matched"),
+        "best_score": result.get("best_score"),
+        "best_id": result.get("best_id"),
+        "route": result.get("route"),
+        "latency_ms": result.get("latency_ms"),
+    })
 
     return result
