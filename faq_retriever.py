@@ -2,24 +2,15 @@
 """
 Sunshine Hotel Voice Agent - FAQ Retriever (BM25 + lightweight synonym/alias expansion)
 
-Goals (exam-focused):
-- Keep *existing* in-domain queries working (IDs in faq.json).
-- Improve Not-Found contract / safe fallback for out-of-domain queries.
-- Avoid external BM25 dependencies (no rank_bm25) to keep Cloud Run builds stable.
-- Provide a stable response contract used by both Swagger (/docs) and the GitHub Pages frontend.
-
-Response contract returned by FAQRetriever.answer():
-{
-  "request_id": str,
-  "matched": bool,
-  "answer": str,
-  "best_score": float,     # 0..1 normalized confidence-like score
-  "best_id": str,
-  "route": str,            # bm25 | not_found | guardrail_* | degraded_*
-  "latency_ms": int,
-  "top": [{"id": str, "question": str, "score": float}, ...]   # scores 0..1
-}
+Fixes included:
+- Backend goodbye intent: returns "Thank you. Goodbye!" consistently (matches frontend behavior).
+- Morphology normalization: plural/singular + noun/verb variants (hour/hours, smoke/smoking, etc.).
+- Out-of-domain fallback reliability:
+  * Fix score normalization bug (weak matches no longer appear as score=1).
+  * Domain gating + OOD conversational patterns to reduce false positives.
+- No external dependencies (safe for Cloud Run builds).
 """
+
 from __future__ import annotations
 
 import json
@@ -31,10 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-
-# ----------------------------
-# Text normalization utilities
-# ----------------------------
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -42,46 +29,74 @@ def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("_", " ")
     s = s.replace("-", " ")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
+def _micro_stems(tok: str) -> List[str]:
+    """
+    Very small, controlled stemming to handle your reported failures:
+    - hours -> hour
+    - methods -> method
+    - rates -> rate
+    - smoking -> smoke
+    - soundproofing -> soundproof
+    Keep it conservative to avoid breaking working queries.
+    """
+    t = tok
+    out = {t}
+
+    if len(t) >= 4 and t.endswith("s") and not t.endswith("ss"):
+        out.add(t[:-1])
+
+    if len(t) >= 6 and t.endswith("ing"):
+        base = t[:-3]
+        out.add(base)
+        # smoke <- smoking
+        if base.endswith("k"):
+            out.add(base + "e")
+
+    if len(t) >= 8 and t.endswith("proofing"):
+        out.add(t.replace("proofing", "proof"))
+
+    return sorted(out)
+
+
 def _tokens(s: str) -> List[str]:
-    # Keep "in"/"out" tokens (important for check-in vs check-out).
-    # We do NOT aggressively remove stopwords because the FAQ corpus is small
-    # and we want to preserve discriminative words.
     s = _norm(s)
-    return _WORD_RE.findall(s)
+    base = _WORD_RE.findall(s)
+    expanded: List[str] = []
+    for b in base:
+        expanded.extend(_micro_stems(b))
+    # De-dup while preserving order
+    seen = set()
+    out = []
+    for t in expanded:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
 
 
-# ----------------------------
-# BM25 implementation (no deps)
-# ----------------------------
 class _BM25:
     def __init__(self, docs: List[List[str]], k1: float = 1.5, b: float = 0.75):
         self.docs = docs
         self.k1 = float(k1)
         self.b = float(b)
+        self.n = len(docs)
+        self.avgdl = (sum(len(d) for d in docs) / self.n) if self.n else 0.0
 
-        self.doc_count = len(docs)
-        self.avgdl = (sum(len(d) for d in docs) /
-                      self.doc_count) if self.doc_count else 0.0
-
-        # document frequencies
         df: Dict[str, int] = {}
         for d in docs:
-            seen = set(d)
-            for t in seen:
+            for t in set(d):
                 df[t] = df.get(t, 0) + 1
         self.df = df
 
-        # idf with BM25+ style smoothing
         self.idf: Dict[str, float] = {}
-        for t, n_q in df.items():
-            self.idf[t] = math.log(
-                1 + (self.doc_count - n_q + 0.5) / (n_q + 0.5))
+        for t, dfi in df.items():
+            self.idf[t] = math.log(1 + (self.n - dfi + 0.5) / (dfi + 0.5))
 
-        # term frequencies per doc
         self.tf: List[Dict[str, int]] = []
         for d in docs:
             m: Dict[str, int] = {}
@@ -89,25 +104,25 @@ class _BM25:
                 m[t] = m.get(t, 0) + 1
             self.tf.append(m)
 
-    def score(self, query_tokens: List[str]) -> List[float]:
+    def score(self, q_tokens: List[str]) -> List[float]:
         if not self.docs:
             return []
-        if not query_tokens:
+        if not q_tokens:
             return [0.0] * len(self.docs)
 
         scores = [0.0] * len(self.docs)
-        for qi in query_tokens:
-            idf = self.idf.get(qi, 0.0)
+        for qt in q_tokens:
+            idf = self.idf.get(qt, 0.0)
             if idf <= 0:
                 continue
-            for i, d in enumerate(self.docs):
-                f = self.tf[i].get(qi, 0)
-                if f == 0:
+            for i in range(len(self.docs)):
+                f = self.tf[i].get(qt, 0)
+                if f <= 0:
                     continue
-                dl = len(d)
+                dl = len(self.docs[i])
                 denom = f + self.k1 * \
                     (1 - self.b + self.b * (dl / (self.avgdl or 1.0)))
-                scores[i] += idf * (f * (self.k1 + 1)) / (denom or 1.0)
+                scores[i] += idf * (f * (self.k1 + 1.0)) / (denom or 1.0)
         return scores
 
 
@@ -115,33 +130,52 @@ class _BM25:
 class _FAQItem:
     faq_id: str
     text: str
-    phrase: str  # human-ish "question" label for top-k display
-    doc_text: str  # indexed text used by BM25
+    phrase: str
+    doc_text: str
 
 
-# ----------------------------
-# Retriever
-# ----------------------------
 class FAQRetriever:
     DEFAULT_FALLBACK = "Sorry, I don't have that information yet. Please contact the hotel reception for assistance."
+    GOODBYE_TEXT = "Thank you. Goodbye!"
 
-    # Out-of-domain hints (keep small + high precision)
-    _OOD_HINTS = {
-        "warranty", "watch", "bicycle", "book", "beer", "alcohol", "wine", "vodka", "whisky",
-        "iphone", "android", "laptop", "printer", "refund", "amazon", "lazada", "shopee",
-        "baggage claim", "airline", "flight", "airport terminal", "passport renewal",
+    # High precision good-bye patterns
+    _GOODBYE_RE = re.compile(
+        r"\b(bye|goodbye|see you|see ya|thanks\s*(and|,)?\s*bye|thank you\s*(and|,)?\s*bye|okay\s*bye|ok\s*bye)\b",
+        re.IGNORECASE,
+    )
+
+    # Strong OOD keywords (keep relatively high precision)
+    _OOD_KEYWORDS = {
+        "warranty", "watch", "bicycle", "bike", "book", "boyfriend", "girlfriend",
+        "sell houses", "electrical bill", "university", "sleeping", "how old are you",
+        # umbrella -> often used in "where is my umbrella"
+        "teach me", "drive", "umbrella",
+        "beer", "vodka", "whisky", "whiskey", "wine",
         "ski", "resort", "mountain", "snow",
-        "car insurance", "motorcycle", "loan", "bank", "credit card bill",
     }
 
-    # In-domain hints (hotel context). If absent, we apply a stricter threshold.
+    # OOD conversational patterns that caused false matches in your evidence
+    _OOD_PATTERNS = [
+        # "Where is my umbrella?"
+        re.compile(r"\bwhere\s+(is|are)\s+my\b", re.IGNORECASE),
+        # "Have you finished dinner?"
+        re.compile(r"\bhave you finished\b", re.IGNORECASE),
+        re.compile(r"\bdo you have (a )?(boyfriend|girlfriend)\b",
+                   re.IGNORECASE),
+        re.compile(r"\bhow old are you\b", re.IGNORECASE),
+        # We'll route these to hotel_identity instead of random
+        re.compile(r"\bwho are you\b", re.IGNORECASE),
+        re.compile(r"\bdo you know who i am\b", re.IGNORECASE),
+    ]
+
+    # Domain hints: if absent, we apply stricter threshold
     _DOMAIN_HINTS = {
-        "hotel", "sunshine", "room", "rooms", "suite", "checkin", "check-in", "check in",
-        "checkout", "check-out", "check out",
+        "hotel", "sunshine", "room", "rooms", "suite", "check", "checkin", "checkout",
         "breakfast", "restaurant", "dining", "wifi", "internet", "pool", "gym", "parking",
         "shuttle", "taxi", "luggage", "late", "early", "deposit", "payment",
-        "reservation", "booking", "cancel", "cancellation", "smoking", "pets",
+        "reservation", "booking", "cancel", "cancellation", "smok", "smoking",
         "address", "location", "contact", "phone", "telephone", "email",
+        "front", "desk",
     }
 
     def __init__(self, faq_path: str = "faq.json"):
@@ -151,11 +185,9 @@ class FAQRetriever:
 
         self.items: List[_FAQItem] = []
         self._bm25: Optional[_BM25] = None
-        self._docs_tokens: List[List[str]] = []
 
         self._load_and_index()
 
-    # Compatibility with older code / tests
     @property
     def is_ready(self) -> bool:
         return bool(self.ready)
@@ -166,13 +198,13 @@ class FAQRetriever:
 
     def _load_and_index(self) -> None:
         try:
-            p = Path(self.faq_path)
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = json.loads(Path(self.faq_path).read_text(encoding="utf-8"))
             if not isinstance(data, list):
-                raise ValueError(
-                    "faq.json must be a list of {id,text} objects")
+                raise ValueError("faq.json must be a list of {id,text}")
 
             items: List[_FAQItem] = []
+            docs_tokens: List[List[str]] = []
+
             for obj in data:
                 if not isinstance(obj, dict):
                     continue
@@ -181,164 +213,210 @@ class FAQRetriever:
                 if not faq_id or not text:
                     continue
 
-                # display label (can be improved later if you add 'question' field)
                 phrase = faq_id
                 doc_text = self._build_doc_text(faq_id, text)
                 items.append(_FAQItem(faq_id=faq_id, text=text,
                              phrase=phrase, doc_text=doc_text))
+                docs_tokens.append(_tokens(doc_text))
 
             self.items = items
-            self._docs_tokens = [_tokens(it.doc_text) for it in self.items]
-            self._bm25 = _BM25(self._docs_tokens)
+            self._bm25 = _BM25(docs_tokens)
             self.ready = True
             self.error = None
+
         except Exception as e:
             self.ready = False
             self.error = f"{type(e).__name__}: {e}"
             self.items = []
-            self._docs_tokens = []
             self._bm25 = None
 
     # ----------------------------
-    # Alias expansion (doc side)
+    # Alias expansion (doc-side)
     # ----------------------------
     def _aliases_for_id(self, faq_id: str) -> List[str]:
         fid = _norm(faq_id)
+        aliases = {fid}
 
-        # base variants
-        aliases = {fid, fid.replace("  ", " ").strip()}
+        # common separator variants
+        aliases.add(fid.replace("  ", " ").strip())
 
-        # check-in / check-out family
+        # check-in/out variants
         if "checkin" in fid or "check in" in fid:
             aliases.update({"check in", "check-in", "checkin"})
         if "checkout" in fid or "check out" in fid:
             aliases.update({"check out", "check-out", "checkout"})
 
-        # common business synonyms
-        def add_pair(a: str, b: str) -> None:
-            if a in fid or b in fid:
-                aliases.update({a, b})
+        # fee/price/cost variants
+        if "fee" in fid or "price" in fid or "cost" in fid:
+            aliases.update({"fee", "price", "cost", "charges", "charge"})
 
-        add_pair("fee", "price")
-        add_pair("fee", "cost")
-        add_pair("contact number", "phone number")
-        add_pair("telephone", "phone")
-        add_pair("location", "address")
-        add_pair("identity", "name")
+        # contact variants
+        if "contact" in fid or "phone" in fid or "telephone" in fid or "email" in fid:
+            aliases.update({"contact number", "phone number",
+                           "telephone", "contact phone", "contact email"})
 
-        # High-impact special cases
+        # identity/name
         if faq_id == "hotel_identity":
             aliases.update({
                 "hotel name", "name of the hotel", "hotel identity", "about the hotel",
                 "what hotel is this", "property name", "sunshine hotel singapore",
+                "who are you", "what are you", "why are you answering",
             })
 
-        # If you have address-like IDs, help match location/address phrasing
+        # address/location
         if "address" in fid or "location" in fid:
             aliases.update({
-                "hotel address", "hotel location", "where is the hotel", "where is sunshine hotel",
-                "where is sunshine hotel singapore", "how to get to the hotel",
+                "hotel address", "hotel location", "where is the hotel",
+                "where is sunshine hotel", "where is sunshine hotel singapore",
+                "how to get to the hotel", "directions",
             })
+
+        # hours singular/plural reinforcement
+        if "hours" in fid or "hour" in fid:
+            aliases.update({"hour", "hours", "opening hours", "open hours"})
 
         return sorted(a for a in aliases if a)
 
     def _build_doc_text(self, faq_id: str, text: str) -> str:
-        # We index:
-        # - ID tokens (underscores/hyphens)
-        # - generated alias phrases
-        # - the actual answer text
         aliases = self._aliases_for_id(faq_id)
-        parts = [faq_id] + aliases + [text]
-        return " | ".join(p for p in parts if p)
+        # Index: original id + aliases + answer text
+        return " | ".join([faq_id] + aliases + [text])
 
     # ----------------------------
-    # Query expansion (query side)
+    # Query expansion (query-side)
     # ----------------------------
     def _expand_query(self, query: str) -> List[str]:
         q0 = _norm(query)
-
-        # Fast guard for totally empty
         if not q0:
-            return [q0]
+            return [""]
 
-        expansions = {q0}
+        ex = {q0}
 
-        # normalize check in/out forms
-        if "check in" in q0 or "check-in" in q0 or "checkin" in q0:
-            expansions.update({q0.replace("check in", "checkin"), q0.replace(
-                "check-in", "checkin"), q0.replace("checkin", "check in")})
-        if "check out" in q0 or "check-out" in q0 or "checkout" in q0:
-            expansions.update({q0.replace("check out", "checkout"), q0.replace(
-                "check-out", "checkout"), q0.replace("checkout", "check out")})
+        # check-in/out variants
+        if "check in" in q0 or "checkin" in q0:
+            ex.add(q0.replace("check in", "checkin"))
+            ex.add(q0.replace("checkin", "check in"))
+        if "check out" in q0 or "checkout" in q0:
+            ex.add(q0.replace("check out", "checkout"))
+            ex.add(q0.replace("checkout", "check out"))
 
-        # phone/contact
-        if "phone" in q0 or "telephone" in q0 or "contact" in q0:
-            expansions.add(q0.replace("phone", "contact number"))
-            expansions.add(q0.replace("telephone", "phone"))
-            expansions.add(q0.replace("contact", "phone"))
-
-        # fee/price/cost
-        if "fee" in q0 or "price" in q0 or "cost" in q0 or "charge" in q0:
-            expansions.add(q0.replace("price", "fee"))
-            expansions.add(q0.replace("cost", "fee"))
-            expansions.add(q0.replace("charge", "fee"))
-
-        # name/identity
-        if ("hotel" in q0) and ("name" in q0 or "identity" in q0 or "property" in q0):
-            expansions.update({
-                q0.replace("name", "identity"),
-                q0.replace("identity", "name"),
-                q0 + " sunshine hotel singapore",
-                "hotel identity sunshine hotel singapore",
-                "hotel name sunshine hotel singapore",
-            })
+        # contact/phone
+        if "phone" in q0 or "contact" in q0 or "telephone" in q0:
+            ex.add(q0.replace("phone", "contact number"))
+            ex.add(q0.replace("contact", "phone"))
+            ex.add(q0.replace("telephone", "phone"))
 
         # address/location
-        if ("hotel" in q0) and ("address" in q0 or "location" in q0 or "located" in q0 or "where" in q0):
-            expansions.update({
-                q0.replace("location", "address"),
-                q0.replace("address", "location"),
-                q0 + " sunshine hotel singapore",
-                "hotel address sunshine hotel singapore",
-                "where is sunshine hotel singapore located",
-            })
+        if "address" in q0 or "location" in q0 or "located" in q0 or "where is" in q0:
+            ex.add(q0.replace("address", "location"))
+            ex.add(q0.replace("location", "address"))
 
-        return sorted(expansions)
+        # identity/name
+        if ("hotel" in q0) and ("name" in q0 or "identity" in q0):
+            ex.add(q0.replace("name", "identity"))
+            ex.add(q0.replace("identity", "name"))
+
+        # plural/singular helpers (hours/hour, methods/method, rates/rate)
+        ex.add(q0.replace("hours", "hour"))
+        ex.add(q0.replace("hour", "hours"))
+        ex.add(q0.replace("methods", "method"))
+        ex.add(q0.replace("method", "methods"))
+        ex.add(q0.replace("rates", "rate"))
+        ex.add(q0.replace("rate", "rates"))
+
+        # smoking/smoke
+        ex.add(q0.replace("smoking", "smoke"))
+        ex.add(q0.replace("smoke", "smoking"))
+
+        # soundproofing/soundproof
+        ex.add(q0.replace("soundproofing", "soundproof"))
+        ex.add(q0.replace("soundproof", "soundproofing"))
+
+        return sorted(s for s in ex if s)
 
     # ----------------------------
-    # Guardrails
+    # Guardrails / routing
     # ----------------------------
+    def _is_goodbye(self, query: str) -> bool:
+        q = _norm(query)
+        if not q:
+            return False
+        return bool(self._GOODBYE_RE.search(q))
+
     def _is_too_short(self, query: str) -> bool:
-        qt = _tokens(query)
-        # one-token garbage like "afggg"
-        return len(qt) < 2 or len(query.strip()) < 3
+        q = _norm(query)
+        if len(q) < 3:
+            return True
+        # single token noises: "afggg"
+        return len(_tokens(q)) < 2
 
-    def _looks_out_of_domain(self, query: str) -> bool:
-        qn = _norm(query)
-        # If it contains any strong OOD hints, treat as OOD.
-        for w in self._OOD_HINTS:
-            if w in qn:
+    def _is_ood(self, query: str) -> bool:
+        q = _norm(query)
+
+        for pat in self._OOD_PATTERNS:
+            if pat.search(q):
+                # Note: "who are you" is not treated as OOD; we route to hotel_identity.
+                if "who are you" in q or "do you know who i am" in q:
+                    return False
                 return True
+
+        for kw in self._OOD_KEYWORDS:
+            if kw in q:
+                # again: allow "who are you" to route to hotel_identity
+                if "who are you" in q:
+                    return False
+                return True
+
         return False
 
     def _has_domain_hint(self, query: str) -> bool:
-        qn = _norm(query)
-        return any(h in qn for h in self._DOMAIN_HINTS)
+        q = _norm(query)
+        return any(h in q for h in self._DOMAIN_HINTS)
+
+    def _route_special(self, query: str) -> Optional[str]:
+        """
+        Special routing:
+        - "who are you" -> hotel_identity
+        This prevents random matches like wifi_password for "who are you?" (seen in your evidence).
+        """
+        q = _norm(query)
+        if "who are you" in q or "why are you answering" in q:
+            return "hotel_identity"
+        return None
+
+    def _answer_by_id(self, faq_id: str, request_id: str, latency_ms: int) -> Dict[str, Any]:
+        for it in self.items:
+            if it.faq_id == faq_id:
+                return {
+                    "request_id": request_id,
+                    "matched": True,
+                    "answer": it.text,
+                    "best_score": 1.0,
+                    "best_id": it.faq_id,
+                    "route": "rule_route",
+                    "latency_ms": latency_ms,
+                    "top": [{"id": it.faq_id, "question": it.phrase, "score": 1.0}],
+                }
+        # If not found, fallback
+        return {
+            "request_id": request_id,
+            "matched": False,
+            "answer": self.DEFAULT_FALLBACK,
+            "best_score": 0.0,
+            "best_id": "",
+            "route": "rule_route_missing",
+            "latency_ms": latency_ms,
+            "top": [],
+        }
 
     # ----------------------------
     # Public API
     # ----------------------------
-    def answer(
-        self,
-        query: str,
-        top_k: int = 5,
-        min_score: float = 0.35,
-        request_id: str = "",
-    ) -> Dict[str, Any]:
+    def answer(self, query: str, top_k: int = 5, min_score: float = 0.35, request_id: str = "") -> Dict[str, Any]:
         t0 = time.time()
         rid = request_id or str(uuid.uuid4())
 
-        if not self.ready or not self._bm25:
+        if not self.ready or not self._bm25 or not self.items:
             return {
                 "request_id": rid,
                 "matched": False,
@@ -350,6 +428,25 @@ class FAQRetriever:
                 "top": [],
             }
 
+        # 1) Goodbye should behave consistently (frontend + backend)
+        if self._is_goodbye(query):
+            return {
+                "request_id": rid,
+                "matched": False,
+                "answer": self.GOODBYE_TEXT,
+                "best_score": 0.0,
+                "best_id": "",
+                "route": "goodbye",
+                "latency_ms": int((time.time() - t0) * 1000),
+                "top": [],
+            }
+
+        # 2) Special routing for "who are you" -> hotel_identity
+        forced = self._route_special(query)
+        if forced:
+            return self._answer_by_id(forced, rid, int((time.time() - t0) * 1000))
+
+        # 3) Guardrails
         if self._is_too_short(query):
             return {
                 "request_id": rid,
@@ -362,7 +459,7 @@ class FAQRetriever:
                 "top": [],
             }
 
-        if self._looks_out_of_domain(query):
+        if self._is_ood(query):
             return {
                 "request_id": rid,
                 "matched": False,
@@ -374,22 +471,22 @@ class FAQRetriever:
                 "top": [],
             }
 
-        # Query expansions (lexical only)
-        expanded = self._expand_query(query)
-
-        # Evaluate each expansion; keep the best overall
-        best_pack: Optional[Tuple[str, List[float]]] = None
+        # 4) BM25 over query expansions — keep best
+        expansions = self._expand_query(query)
+        best_raw_scores: Optional[List[float]] = None
+        best_q: Optional[str] = None
         best_raw_max = -1.0
 
-        for qx in expanded:
+        for qx in expansions:
             q_tokens = _tokens(qx)
             raw_scores = self._bm25.score(q_tokens)
             raw_max = max(raw_scores) if raw_scores else 0.0
             if raw_max > best_raw_max:
                 best_raw_max = raw_max
-                best_pack = (qx, raw_scores)
+                best_raw_scores = raw_scores
+                best_q = qx
 
-        if not best_pack or best_raw_max <= 0:
+        if not best_raw_scores or best_raw_max <= 0:
             return {
                 "request_id": rid,
                 "matched": False,
@@ -401,48 +498,51 @@ class FAQRetriever:
                 "top": [],
             }
 
-        qx, raw_scores = best_pack
+        # 5) Proper confidence score (fixes “everything becomes 1.0” bug)
+        # Use bounded transform + margin to 2nd best
+        idx_sorted = sorted(range(len(best_raw_scores)),
+                            key=lambda i: best_raw_scores[i], reverse=True)
+        best_idx = idx_sorted[0]
+        best_raw = best_raw_scores[best_idx]
+        second_raw = best_raw_scores[idx_sorted[1]] if len(
+            idx_sorted) > 1 else 0.0
 
-        # Normalize scores for reporting/thresholding to a 0..1 range
-        raw_max = max(raw_scores) if raw_scores else 0.0
-        norm_scores = [(s / raw_max) if raw_max >
-                       0 else 0.0 for s in raw_scores]
+        K = 6.0  # smoothing constant
+        best_norm = best_raw / (best_raw + K) if best_raw > 0 else 0.0
+        gap = (best_raw - second_raw) / \
+            (best_raw + 1e-9) if best_raw > 0 else 0.0
+        gap = max(0.0, min(1.0, gap))
+        conf = 0.75 * best_norm + 0.25 * gap
 
-        # Get top-k indices
-        k = max(1, int(top_k))
-        idxs = sorted(range(len(norm_scores)),
-                      key=lambda i: norm_scores[i], reverse=True)[:k]
-
-        best_idx = idxs[0]
-        best_item = self.items[best_idx]
-        best_score = float(norm_scores[best_idx])
-
-        # Stricter threshold if query has no in-domain hints (reduces false positives)
+        # 6) Domain gating: stricter threshold if query doesn't look hotel-related
         effective_min = float(min_score)
         if not self._has_domain_hint(query):
-            effective_min = min(0.75, effective_min + 0.15)
+            effective_min = min(0.85, effective_min + 0.20)
 
-        matched = best_score >= effective_min
+        matched = conf >= effective_min
 
-        top_list = []
-        for i in idxs:
+        # 7) Build top list with normalized scores (bounded)
+        top_k = max(1, min(int(top_k or 5), 10))
+        top_idxs = idx_sorted[:top_k]
+        top = []
+        for i in top_idxs:
+            s = best_raw_scores[i]
+            s_norm = s / (s + K) if s > 0 else 0.0
             it = self.items[i]
-            top_list.append({
-                "id": it.faq_id,
-                "question": it.phrase or it.faq_id,
-                "score": round(float(norm_scores[i]), 4),
-            })
+            top.append({"id": it.faq_id, "question": it.phrase,
+                       "score": round(float(s_norm), 4)})
 
-        route = "bm25" if matched else "not_found"
+        best_item = self.items[best_idx]
         answer_text = best_item.text if matched else self.DEFAULT_FALLBACK
+        route = "bm25" if matched else "not_found"
 
         return {
             "request_id": rid,
             "matched": bool(matched),
             "answer": answer_text,
-            "best_score": round(float(best_score), 4),
+            "best_score": round(float(conf), 4),
             "best_id": best_item.faq_id if matched else "",
             "route": route,
             "latency_ms": int((time.time() - t0) * 1000),
-            "top": top_list,
+            "top": top,
         }
