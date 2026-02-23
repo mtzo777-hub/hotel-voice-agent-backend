@@ -1,41 +1,76 @@
-# main.py
+"""
+main.py
+
+FastAPI backend for Sunshine Hotel Voice Agent (FAQ retrieval).
+Designed for Cloud Run deployment with structured logs (Cloud Logging).
+"""
+
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
-from typing import Optional
+from typing import Any, Dict
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from faq_retriever import FAQRetriever
 
-
-APP_VERSION = os.getenv("APP_VERSION", "2026.02.22")
+APP_VERSION = os.getenv("APP_VERSION", "2026.02.23")
 
 app = FastAPI(
     title="Hotel Voice Agent Backend",
     version=APP_VERSION,
+    description="BM25 FAQ retrieval backend for Sunshine Hotel Voice Agent.",
 )
 
-# IMPORTANT: faq.json should be bundled into the container image (same folder as main.py) OR copied in Dockerfile.
+# CORS: allow GitHub Pages frontend and local dev. (Safe here because no auth / no secrets.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 FAQ_PATH = os.getenv("FAQ_PATH", "faq.json")
-
-retriever: Optional[FAQRetriever] = None
-retriever_error: Optional[str] = None
+retriever = FAQRetriever(FAQ_PATH)
 
 
-class FaqRequest(BaseModel):
-    query: str = Field(...,
-                       description="User question (typed or recognized speech)")
-    top_k: int = Field(
-        5, ge=1, le=20, description="Number of candidates to return (debug)")
-    min_score: float = Field(0.35, ge=0.0, le=1.0,
-                             description="Confidence threshold (0..1)")
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-class FaqResponse(BaseModel):
+def _request_id(req: Request) -> str:
+    rid = req.headers.get(
+        "x-request-id") or req.headers.get("x-cloud-trace-context")
+    if rid:
+        return rid.split("/")[0]
+    return str(uuid.uuid4())
+
+
+def _log(event: str, payload: Dict[str, Any]) -> None:
+    # Cloud Run captures stdout/stderr into Cloud Logging.
+    record = {"event": event, **payload}
+    print(json.dumps(record, ensure_ascii=False))
+
+
+class FAQRequest(BaseModel):
+    query: str = Field(..., examples=["When is check-in time?"])
+    top_k: int = Field(5, ge=1, le=10, examples=[5])
+    min_score: float = Field(0.35, ge=0.0, le=1.0, examples=[0.35])
+
+    class Config:
+        # This restores the Swagger "Edit Value" defaults nicely.
+        json_schema_extra = {
+            "example": {"query": "When is check-in time?", "top_k": 5, "min_score": 0.35}
+        }
+
+
+class FAQResponse(BaseModel):
     request_id: str
     matched: bool
     answer: str
@@ -46,19 +81,9 @@ class FaqResponse(BaseModel):
     top: list
 
 
-@app.on_event("startup")
-def _startup() -> None:
-    global retriever, retriever_error
-    try:
-        retriever = FAQRetriever(FAQ_PATH)
-        retriever_error = None
-    except Exception as e:
-        retriever = None
-        retriever_error = f"{type(e).__name__}: {e}"
-
-
-@app.get("/", tags=["default"])
-def root():
+@app.get("/")
+def root() -> Dict[str, Any]:
+    # Restore GET / Root (you said you prefer the old Swagger layout)
     return {
         "service": "hotel-voice-agent-backend",
         "version": APP_VERSION,
@@ -66,63 +91,45 @@ def root():
     }
 
 
-@app.get("/health", tags=["default"])
-def health():
-    if retriever is None:
-        return {"status": "degraded", "retriever": "unavailable", "error": retriever_error, "version": APP_VERSION}
-    return {"status": "ok", "retriever": "ok", "faq_count": retriever.faq_count, "version": APP_VERSION}
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    if retriever.is_ready:
+        return {"status": "ok", "retriever": "ok", "faq_count": retriever.faq_count, "version": APP_VERSION}
+    return {"status": "degraded", "retriever": "unavailable", "error": "retriever_not_ready", "version": APP_VERSION}
 
 
-@app.post("/faq/answer", response_model=FaqResponse, tags=["default"])
-async def faq_answer(payload: FaqRequest, request: Request):
-    """
-    Main API used by frontend.
-    Returns a stable contract and includes request_id for log correlation.
-    """
-    t0 = time.perf_counter()
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+@app.post("/faq/answer", response_model=FAQResponse)
+async def faq_answer(req: Request, body: FAQRequest) -> Dict[str, Any]:
+    rid = _request_id(req)
 
-    if retriever is None:
-        # backend degraded, but still return a safe response
-        return {
-            "request_id": request_id,
-            "matched": False,
-            "answer": "Sorry, the FAQ knowledge base is currently unavailable.",
-            "best_score": 0.0,
-            "best_id": "",
-            "route": "degraded_no_index",
-            "latency_ms": int((time.perf_counter() - t0) * 1000),
-            "top": [],
-        }
+    t0 = _now_ms()
+    _log(
+        "faq_answer_request",
+        {
+            "request_id": rid,
+            "query": body.query,
+            "query_len": len(body.query or ""),
+            "top_k": body.top_k,
+            "min_score": body.min_score,
+            "client_ip": req.client.host if req.client else None,
+            "user_agent": req.headers.get("user-agent"),
+        },
+    )
 
     result = retriever.answer(
-        query=payload.query,
-        top_k=payload.top_k,
-        min_score=payload.min_score,
-        request_id=request_id,
-    )
-    # Ensure latency is always filled even if retriever returned quickly
-    result["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+        body.query, top_k=body.top_k, min_score=body.min_score, request_id=rid)
+    result["latency_ms"] = _now_ms() - t0  # end-to-end time
 
-    # Structured log line for Cloud Run / Cloud Logging
-    # (Cloud Run will capture stdout/stderr automatically)
-    client_ip = request.client.host if request.client else ""
-    ua = request.headers.get("user-agent", "")
-    print(
+    _log(
+        "faq_answer_response",
         {
-            "app": "hotel_voice_agent",
-            "event": "faq_answer",
-            "request_id": request_id,
-            "query": payload.query,
-            "top_k": payload.top_k,
-            "min_score": payload.min_score,
-            "matched": result.get("matched", False),
-            "best_id": result.get("best_id", ""),
-            "best_score": result.get("best_score", 0.0),
-            "route": result.get("route", ""),
-            "latency_ms": result.get("latency_ms", 0),
-            "client_ip": client_ip,
-            "user_agent": ua,
-        }
+            "request_id": rid,
+            "matched": result.get("matched"),
+            "best_score": result.get("best_score"),
+            "best_id": result.get("best_id"),
+            "route": result.get("route"),
+            "latency_ms": result.get("latency_ms"),
+        },
     )
+
     return result
