@@ -16,3 +16,11 @@ github-deployer-key.json
 # Logs / OS junk
 *.log
 .DS_Store
+# local test outputs
+faq_test_report.csv
+generated_template_report.csv
+
+# local dev scripts (keep local only)
+run_faq_tests_v2.py
+run_generated_templates.py
+
